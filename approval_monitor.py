@@ -1,404 +1,128 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-허가 모니터링 모듈
-==================
-4개국 규제기관에서 신약/생물의약품 허가 정보를 수집한다. 소스별로 신뢰도가 다르다:
+보고서 모니터링 모듈
+====================
+컨설팅사·기관 인사이트 페이지에서 최신 보고서 목록을 수집한다.
 
-- FDA CBER, FDA CDER : 정적 HTML 테이블 확인 완료, 안정적으로 동작
-- PMDA               : 목록이 PDF/Excel 첨부파일로만 제공되어, 첨부파일 URL이 바뀌면
-                        "갱신 감지" 알림만 표시 (개별 품목 추출은 하지 않음)
-- 한국 MFDS, EU       : 페이지 구조를 사전 검증하지 못해 최초 버전은 베스트 에포트.
-                        실제 실행 결과를 보고 선택자를 조정해야 할 수 있다.
+동작 방식이 두 가지로 나뉜다:
+1. SCRAPE_SOURCES: 정적 HTML이라 실제로 제목·링크를 긁어올 수 있는 곳
+   (href의 URL 패턴으로 매칭 — CSS 클래스에 의존하지 않아 사이트 개편에 비교적 안전)
+2. STATIC_LINK_SOURCES: 자바스크립트 렌더링이거나(Deloitte, IQVIA Points of View),
+   자동 접근이 차단됐거나(NIFDS, BCG), 페이지 자체에 목록이 없는(PwC) 곳.
+   이런 곳은 개별 보고서 추출을 포기하고 "바로가기" 카드만 제공한다.
+
+새로 나타난 항목은 이전 실행 결과(docs/seen_reports.json)와 비교해 NEW 뱃지를 붙인다.
 """
 
 import os
 import re
 import json
 import requests
-from datetime import datetime
 from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
-SEEN_STATE_PATH = "docs/seen_approvals.json"
-PMDA_STATE_PATH = "docs/pmda_attachments.json"
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApprovalMonitorBot/1.0; +https://github.com)"}
-REQUEST_TIMEOUT = 15
+SEEN_STATE_PATH = "docs/seen_reports.json"
+REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReportMonitorBot/1.0; +https://github.com)"}
+REQUEST_TIMEOUT = 12
+
+# 보고서 발간일/업로드일 추출용 날짜 패턴 (링크 주변 텍스트에서 찾는다 - 사이트마다 형식이 달라 베스트 에포트)
+DATE_PATTERNS = [
+    r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}",              # 2026.07.15 / 2026-07-15 / 2026/07/15
+    r"[A-Za-z]{3,9}\s+\d{1,2},?\s*-?\s*\d{4}",        # Jul 10, 2026 / Jul 10 - 2026
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",               # 10 July 2026
+]
 
 
-def normalize_date(date_text):
-    """다양한 형식의 날짜 문자열을 YYYY-MM-DD로 통일. 파싱 실패 시 원본 텍스트 그대로 반환."""
-    if not date_text:
-        return ""
-    try:
-        dt = dateparser.parse(date_text, fuzzy=True)
-        return dt.strftime("%Y-%m-%d")
-    except Exception:
-        return date_text
+def find_nearby_date(tag, max_levels=4):
+    """링크 태그 주변(부모 요소들)의 텍스트에서 날짜로 보이는 문자열을 찾아 YYYY-MM-DD로 반환.
+    사이트마다 날짜 위치·형식이 달라 100% 정확하지는 않은 베스트 에포트 방식."""
+    node = tag
+    for _ in range(max_levels):
+        if node is None:
+            break
+        text = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
+        for pat in DATE_PATTERNS:
+            m = re.search(pat, text)
+            if m:
+                try:
+                    dt = dateparser.parse(m.group(0), fuzzy=True)
+                    return dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+        node = node.parent
+    return None
+
+# -----------------------------
+# 1. 실제로 긁어오는 소스 (href URL 패턴 매칭 방식)
+# -----------------------------
+
+SCRAPE_SOURCES = [
+    {
+        "label": "한국바이오협회 - 리포트",
+        "url": "https://koreabio.org/board/board.php?bo_table=report",
+        "pattern": r"bo_table=report&idx=\d+",
+        "limit": 6,
+    },
+    {
+        "label": "한국바이오협회 - 브리프",
+        "url": "https://koreabio.org/board/board.php?bo_table=brief",
+        "pattern": r"bo_table=brief&idx=\d+",
+        "limit": 6,
+    },
+    {
+        "label": "IQVIA Institute",
+        "url": "https://www.iqvia.com/insights/the-iqvia-institute/reports-and-publications/reports",
+        "pattern": r"/insights/the-iqvia-institute/reports-and-publications/reports/[a-z0-9]",
+        "exclude_exact": [
+            "https://www.iqvia.com/insights/the-iqvia-institute/reports-and-publications/reports/reports-archive",
+        ],
+        "limit": 8,
+    },
+    {
+        "label": "Evaluate Thought Leadership",
+        "url": "https://www.evaluate.com/thought-leadership/",
+        "pattern": r"/thought-leadership/[a-zA-Z0-9][a-zA-Z0-9\-]{4,}",
+        "exclude_exact": [
+            "https://www.evaluate.com/thought-leadership/",
+            "https://www.evaluate.com/ja/thought-leadership/",
+        ],
+        "limit": 8,
+    },
+    {
+        "label": "KPMG Insights (제약·바이오 필터)",
+        "url": "https://kpmg.com/kr/ko/insights.html",
+        "pattern": r"/insights/(eri|aci|tkc)/",
+        "limit": 30,  # 필터링 전 넉넉히 수집
+        "keyword_filter": [
+            "제약", "바이오", "헬스케어", "의료", "생명과학", "건강", "의약품", "병원",
+            "Pharma", "Health", "Bio", "Life Science",
+        ],
+        "post_limit": 6,  # 필터링 후 최종 개수
+    },
+]
+
+# -----------------------------
+# 2. 자동 수집이 어려운 소스 (바로가기만 제공)
+# -----------------------------
+
+STATIC_LINK_SOURCES = [
+    {"label": "PwC Healthcare", "url": "https://www.pwc.com/kr/ko/industry/healthcare.html",
+     "note": "페이지에 개별 보고서 목록이 없어 바로가기만 제공합니다."},
+    {"label": "Deloitte 제약·바이오", "url": "https://www.deloitte.com/kr/ko/Industries/life-sciences.html",
+     "note": "자바스크립트 렌더링 페이지라 바로가기만 제공합니다."},
+    {"label": "IQVIA Points of View", "url": "https://www.iqvia.com/insights/points-of-view",
+     "note": "자바스크립트 렌더링 페이지라 바로가기만 제공합니다."},
+    {"label": "BCG Insights", "url": "https://www.bcg.com/search?q=&f3=00000184-8641-d1ac-a9ef-c7d178680000&f7=00000171-f17b-d394-ab73-f3fbae0d0000&s=1",
+     "note": "사이트가 자동 접근을 차단해 바로가기만 제공합니다."},
+    {"label": "식품의약품안전평가원(NIFDS)", "url": "https://www.nifds.go.kr/brd/m_18/list.do",
+     "note": "사이트가 자동 접근을 차단해 바로가기만 제공합니다."},
+]
 
 
 def fetch(url, timeout=REQUEST_TIMEOUT):
     return requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
 
-
-def load_json(path):
-    if os.path.exists(path):
-        try:
-            with open(path, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-
-def save_json(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-
-
-# -----------------------------
-# 1. FDA CBER - "What's New for Biologics" (안정적)
-# -----------------------------
-
-def scrape_fda_cber(limit=10):
-    label = "FDA CBER (생물학적제제)"
-    url = "https://www.fda.gov/vaccines-blood-biologics/news-events-biologics/whats-new-biologics"
-    try:
-        resp = fetch(url)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"[WARN] {label} 요청 실패: {e}")
-        return []
-
-    items = []
-    for row in soup.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
-            continue
-        date_text = cells[0].get_text(strip=True)
-        link_tag = cells[1].find("a")
-        if not link_tag:
-            continue
-        title = link_tag.get_text(strip=True)
-        if "Approval Letter" not in title:
-            continue  # 허가 레터만 (SOPP·가이던스 문서 등은 제외)
-        href = link_tag.get("href", "")
-        full_link = href if href.startswith("http") else "https://www.fda.gov" + href
-        items.append({"date": normalize_date(date_text), "title": title, "link": full_link, "source": label})
-
-    print(f"[INFO] {label}: {len(items)}건 수집")
-    return items[:limit]
-
-
-# -----------------------------
-# 2. FDA CDER - Drugs@FDA 월간 승인 리포트 (안정적이나 노이즈 필터링 필요)
-# -----------------------------
-
-def scrape_fda_cder(limit=15):
-    label = "FDA CDER"
-    url = "https://www.accessdata.fda.gov/SCRIPTS/CDER/DAF/index.cfm?event=reportsSearch.process"
-    try:
-        resp = fetch(url)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"[WARN] {label} 요청 실패: {e}")
-        return []
-
-    tables = soup.find_all("table")
-    if not tables:
-        print(f"[WARN] {label}: 테이블을 찾지 못함")
-        return []
-    # 행이 가장 많은 테이블 = 승인 목록 테이블
-    target = max(tables, key=lambda t: len(t.find_all("tr")))
-
-    items = []
-    for row in target.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 6:
-            continue
-        link_tag = cells[1].find("a") if len(cells) > 1 else None
-        if not link_tag:
-            continue
-        drug_name = link_tag.get_text(strip=True)
-        date_text = cells[0].get_text(strip=True)
-        classification = cells[5].get_text(strip=True) if len(cells) > 5 else ""
-
-        # 노이즈 제거: 생물의약품(BLA) 또는 진짜 신약(New Molecular Entity)만
-        is_bla = "BLA" in drug_name
-        is_nme = "New Molecular Entity" in classification
-        if not (is_bla or is_nme):
-            continue
-
-        href = link_tag.get("href", "")
-        full_link = href if href.startswith("http") else "https://www.accessdata.fda.gov" + href
-        tag = "BLA(생물의약품)" if is_bla else "신물질(NME)"
-        items.append({
-            "date": normalize_date(date_text), "title": f"{drug_name} [{tag}]",
-            "link": full_link, "source": label,
-        })
-
-    print(f"[INFO] {label}: {len(items)}건 수집 (BLA/신물질 필터 적용)")
-    return items[:limit]
-
-
-# -----------------------------
-# 3. PMDA - 첨부파일(PDF/Excel) 갱신 감지 방식
-# -----------------------------
-
-PMDA_PAGES = [
-    {"label": "PMDA 신의약품 승인목록", "url": "https://www.pmda.go.jp/review-services/drug-reviews/review-information/p-drugs/0040.html"},
-    {"label": "PMDA 신재생의료등제품 승인목록", "url": "https://www.pmda.go.jp/review-services/drug-reviews/review-information/ctp/0018.html"},
-]
-
-
-def get_last_modified_date(url):
-    """파일 URL의 HTTP Last-Modified 헤더로 실제 파일 갱신 날짜를 가져온다.
-    헤더가 없으면 None 반환 (호출부에서 감지 날짜로 대체)."""
-    try:
-        resp = requests.head(url, headers=REQUEST_HEADERS, timeout=8, allow_redirects=True)
-        lm = resp.headers.get("Last-Modified")
-        if lm:
-            from email.utils import parsedate_to_datetime
-            dt = parsedate_to_datetime(lm)
-            return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-    return None
-
-
-def check_pmda_updates():
-    """PMDA는 개별 승인 품목이 HTML이 아닌 PDF/Excel 첨부파일로만 제공된다.
-    첨부파일 URL이 이전 실행과 다르면(=파일이 갱신됐다는 뜻) NEW로 표시하고,
-    가능하면 파일의 실제 갱신 날짜(Last-Modified 헤더)도 함께 보여준다."""
-    prev_state = load_json(PMDA_STATE_PATH) or {}
-    new_state = {}
-    results = []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-
-    for page in PMDA_PAGES:
-        label = page["label"]
-        try:
-            resp = fetch(page["url"])
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except Exception as e:
-            print(f"[WARN] {label} 요청 실패: {e}")
-            continue
-
-        attachment_hrefs = sorted({
-            a["href"] for a in soup.find_all("a", href=True)
-            if a["href"].lower().endswith((".pdf", ".xlsx", ".xls"))
-        })
-        attachments_full = [
-            href if href.startswith("http") else requests.compat.urljoin(page["url"], href)
-            for href in attachment_hrefs
-        ]
-
-        new_state[label] = attachment_hrefs
-        prev_attachments = set(prev_state.get(label, []))
-        is_updated = bool(attachment_hrefs) and set(attachment_hrefs) != prev_attachments
-
-        date_str = None
-        if attachments_full:
-            date_str = get_last_modified_date(attachments_full[0])
-        if not date_str and is_updated:
-            date_str = today_str  # 헤더로 못 가져오면 감지된(오늘) 날짜로 대체
-
-        note = "최근 갱신 없음"
-        if is_updated:
-            note = f"첨부파일이 갱신되었습니다 ({date_str}) - 클릭해서 확인하세요" if date_str else "첨부파일이 갱신되었습니다 - 클릭해서 확인하세요"
-
-        results.append({
-            "title": label,
-            "link": page["url"],
-            "source": "PMDA (일본)",
-            "is_new": is_updated,
-            "date": date_str,
-            "note": note,
-        })
-        print(f"[INFO] {label}: 첨부 {len(attachment_hrefs)}개, 갱신여부={is_updated}, 날짜={date_str}")
-
-    save_json(PMDA_STATE_PATH, new_state)
-    return results
-
-
-# -----------------------------
-# 4. 한국 MFDS(식약처) - 베스트 에포트 (실행 결과 보고 조정 필요)
-# -----------------------------
-
-MFDS_SOURCES = [
-    {
-        "label": "국내 생물의약품 허가",
-        "url": "https://nedrug.mfds.go.kr/searchDrug?sort=&sortOrder=false&searchYn=true&ExcelRowdata=&page=1&searchDivision=detail&itemName=&itemEngName=&entpName=&entpEngName=&ingrName1=&ingrName2=&ingrName3=&ingrEngName=&itemSeq=&stdrCodeName=&atcCodeName=&indutyClassCode=C0&sClassNo=&narcoticKindCode=&cancelCode=&etcOtcCode=&makeMaterialGb=&searchConEe=AND&eeDocData=&searchConUd=AND&udDocData=&searchConNb=AND&nbDocData=&startPermitDate=&endPermitDate=",
-    },
-    {
-        "label": "국내 첨단바이오의약품 허가",
-        "url": "https://nedrug.mfds.go.kr/searchDrug?sort=&sortOrder=false&searchYn=true&ExcelRowdata=&page=1&searchDivision=detail&itemName=&itemEngName=&entpName=&entpEngName=&ingrName1=&ingrName2=&ingrName3=&ingrEngName=&itemSeq=&stdrCodeName=&atcCodeName=&indutyClassCode=J0&sClassNo=&narcoticKindCode=&cancelCode=&etcOtcCode=&makeMaterialGb=&searchConEe=AND&eeDocData=&searchConUd=AND&udDocData=&searchConNb=AND&nbDocData=&startPermitDate=&endPermitDate=",
-    },
-]
-
-
-def strip_label_prefix(text, label):
-    """모바일 반응형 테이블에서 셀 안에 숨겨진 컬럼명 라벨이 값 앞에 같이 붙어 나오는 경우
-    (예: '제품명BMS수출용...') 그 라벨 접두어만 제거한다."""
-    text = (text or "").strip()
-    if label and text.startswith(label):
-        return text[len(label):].strip()
-    return text
-
-
-def scrape_mfds(source, limit=10):
-    label = source["label"]
-    try:
-        resp = fetch(source["url"])
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"[WARN] {label} 요청 실패: {e}")
-        return []
-
-    tables = soup.find_all("table")
-    if not tables:
-        print(f"[WARN] {label}: 테이블을 찾지 못함 (페이지 구조 확인 필요 - 베스트 에포트 단계)")
-        return []
-
-    target = max(tables, key=lambda t: len(t.find_all("tr")))
-
-    # 헤더 행에서 "제품명"/"허가일" 컬럼 위치를 찾는다 (표 구조가 바뀌어도 비교적 안전)
-    header_row = target.find("tr")
-    header_cells = header_row.find_all(["th", "td"]) if header_row else []
-    headers = [h.get_text(strip=True) for h in header_cells]
-
-    def find_idx(keyword):
-        for i, h in enumerate(headers):
-            if keyword in h:
-                return i
-        return None
-
-    idx_name = find_idx("제품명")
-    idx_date = find_idx("허가일")
-
-    items = []
-    seen_titles = set()
-    for row in target.find_all("tr")[1:]:
-        cells = row.find_all("td")
-        if not cells:
-            continue
-
-        if idx_name is not None and idx_name < len(cells):
-            title = strip_label_prefix(cells[idx_name].get_text(strip=True), "제품명")
-        else:
-            title = strip_label_prefix(cells[0].get_text(strip=True), "제품명") if cells else ""
-
-        if not title or title in seen_titles:
-            continue  # 동일 제품명 중복 행 제거
-        seen_titles.add(title)
-
-        date_text = ""
-        if idx_date is not None and idx_date < len(cells):
-            date_text = normalize_date(strip_label_prefix(cells[idx_date].get_text(strip=True), "허가일"))
-
-        link_tag = row.find("a", href=True)
-        href = link_tag["href"] if link_tag else None
-        if href and href.startswith("http"):
-            full_link = href
-        elif href:
-            full_link = "https://nedrug.mfds.go.kr" + (href if href.startswith("/") else "/" + href)
-        else:
-            full_link = source["url"]
-
-        items.append({"title": title, "link": full_link, "source": label, "date": date_text})
-        if len(items) >= limit:
-            break
-
-    print(f"[INFO] {label}: {len(items)}건 수집 (베스트 에포트, 헤더: {headers[:9]})")
-    return items
-
-
-# -----------------------------
-# 5. EU 의약품 신규 허가 - Community Register (Playwright 필요)
-# -----------------------------
-# 이 페이지는 자바스크립트로 데이터를 비동기로 불러와 그리는 방식이라(DataTables류),
-# requests만으로는 빈 껍데기만 받아진다(실제 브라우저에서는 정상적으로 표가 보임).
-# 실제 브라우저처럼 렌더링해야 하므로 Playwright(헤드리스 Chromium)를 사용한다.
-#
-# "Decision type" 컬럼이 정확히 "Centralised - Authorisation"인 행만 추려서
-# 신규 허가만 가져온다 (Variation·Renewal·Withdrawal 등은 제외).
-
-EU_SOURCE = {
-    "label": "EU 신규 허가 (Community Register)",
-    "url": "https://ec.europa.eu/health/documents/community-register/html/reg_last.htm",
-}
-
-
-def scrape_eu_playwright(limit=20):
-    label = EU_SOURCE["label"]
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print(f"[WARN] {label}: playwright가 설치되어 있지 않아 건너뜁니다 "
-              f"(pip install playwright && playwright install --with-deps chromium 필요)")
-        return []
-
-    items = []
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch()
-            page = browser.new_page()
-            page.goto(EU_SOURCE["url"], timeout=30000, wait_until="networkidle")
-            page.wait_for_selector("table tr", timeout=15000)
-
-            # 헤더 텍스트로 컬럼 위치를 동적으로 찾는다 (사이트 구조가 조금 바뀌어도 안전하도록)
-            header_cells = page.query_selector_all("table thead tr th") or page.query_selector_all("table tr:first-of-type th")
-            headers = [h.inner_text().strip().lower() for h in header_cells]
-
-            def find_idx(keyword):
-                for i, h in enumerate(headers):
-                    if keyword in h:
-                        return i
-                return None
-
-            idx_product = find_idx("product")
-            idx_type = find_idx("decision type")
-            idx_date = find_idx("decision date")
-
-            rows = page.query_selector_all("table tbody tr") or page.query_selector_all("table tr")
-            for row in rows:
-                cells = row.query_selector_all("td")
-                if not cells or idx_type is None or idx_type >= len(cells):
-                    continue
-                decision_type = cells[idx_type].inner_text().strip()
-                if decision_type != "Centralised - Authorisation":
-                    continue  # 신규 허가만 (Variation/Renewal/Withdrawal 등 제외)
-
-                product_cell = cells[idx_product] if idx_product is not None and idx_product < len(cells) else cells[0]
-                link_el = product_cell.query_selector("a")
-                title = (link_el.inner_text() if link_el else product_cell.inner_text()).strip()
-                if not title:
-                    continue
-                href = link_el.get_attribute("href") if link_el else None
-                full_link = href if (href and href.startswith("http")) else EU_SOURCE["url"]
-                date_text = cells[idx_date].inner_text().strip() if idx_date is not None and idx_date < len(cells) else ""
-
-                items.append({"date": normalize_date(date_text), "title": title, "link": full_link, "source": label})
-                if len(items) >= limit:
-                    break
-
-            browser.close()
-    except Exception as e:
-        print(f"[WARN] {label} 수집 실패: {e}")
-        return []
-
-    print(f"[INFO] {label}: {len(items)}건 수집 (Centralised - Authorisation 필터)")
-    return items
-
-
-# -----------------------------
-# 6. 통합 수집 + NEW 뱃지
-# -----------------------------
 
 def load_seen():
     if os.path.exists(SEEN_STATE_PATH):
@@ -416,29 +140,70 @@ def save_seen(seen_links):
         json.dump(sorted(seen_links), f, ensure_ascii=False)
 
 
-def collect_approvals():
+def scrape_by_href_pattern(source):
+    """href URL 패턴으로 보고서 링크를 찾는 범용 스크래퍼.
+    CSS 클래스명에 의존하지 않아 사이트 디자인이 바뀌어도 비교적 안전하다."""
+    label = source["label"]
+    try:
+        resp = fetch(source["url"])
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as e:
+        print(f"[WARN] {label} 요청 실패: {e}")
+        return []
+
+    pattern = re.compile(source["pattern"])
+    exclude_exact = set(source.get("exclude_exact", []))
+    keyword_filter = source.get("keyword_filter")
+    limit = source.get("limit", 8)
+
+    items = []
+    seen_links = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not pattern.search(href):
+            continue
+        title = a.get_text(strip=True)
+        if not title or len(title) < 4:
+            continue
+        full_link = href if href.startswith("http") else requests.compat.urljoin(source["url"], href)
+        if full_link in exclude_exact or full_link in seen_links:
+            continue
+        if keyword_filter and not any(kw in title for kw in keyword_filter):
+            continue
+        seen_links.add(full_link)
+        date_str = find_nearby_date(a)
+        items.append({"title": title, "link": full_link, "source": label, "date": date_str})
+        if len(items) >= limit:
+            break
+
+    post_limit = source.get("post_limit")
+    if post_limit:
+        items = items[:post_limit]
+
+    print(f"[INFO] {label}: {len(items)}건 수집")
+    return items
+
+
+def collect_reports():
+    """전체 소스에서 보고서를 수집하고 NEW 여부를 표시한다."""
     seen = load_seen()
     all_items = []
 
-    all_items.extend(scrape_fda_cber())
-    all_items.extend(scrape_fda_cder())
-    for src in MFDS_SOURCES:
-        all_items.extend(scrape_mfds(src))
-    all_items.extend(scrape_eu_playwright())
-
-    for item in all_items:
-        item["is_new"] = item["link"] not in seen
+    for source in SCRAPE_SOURCES:
+        items = scrape_by_href_pattern(source)
+        for item in items:
+            item["is_new"] = item["link"] not in seen
+        all_items.extend(items)
 
     new_seen = seen | {item["link"] for item in all_items}
     save_seen(new_seen)
 
-    pmda_results = check_pmda_updates()  # PMDA는 별도 상태 파일로 갱신 여부만 관리
-
-    return all_items, pmda_results
+    return all_items
 
 
 # -----------------------------
-# 7. HTML 렌더링
+# 3. HTML 렌더링
 # -----------------------------
 
 def escape_html(text):
@@ -451,7 +216,8 @@ def escape_html(text):
     )
 
 
-def build_approval_panel_html(items, pmda_results):
+def build_report_panel_html(items):
+    """보고서 모니터링 패널의 내부 HTML(카드들)을 생성. 전체 <html> 래핑은 하지 않는다."""
     grouped = {}
     order = []
     for item in items:
@@ -461,10 +227,10 @@ def build_approval_panel_html(items, pmda_results):
             order.append(src)
         grouped[src].append(item)
 
-    parts = ['<div class="panel-header"><h2>✅ 허가 모니터링</h2></div>']
+    parts = ['<div class="panel-header"><h2>📑 보고서 모니터링</h2></div>']
 
-    if not order and not pmda_results:
-        parts.append('<p class="empty">수집된 허가 정보가 없습니다.</p>')
+    if not order:
+        parts.append('<p class="empty">수집된 보고서가 없습니다.</p>')
     else:
         for src in order:
             parts.append('<div class="src-block">')
@@ -478,25 +244,24 @@ def build_approval_panel_html(items, pmda_results):
                 )
             parts.append("</div>")
 
-        if pmda_results:
-            parts.append('<div class="src-block"><h3>PMDA (일본)</h3>')
-            for r in pmda_results:
-                new_badge = ' <span class="new-badge">갱신됨</span>' if r.get("is_new") else ""
-                parts.append(
-                    f'<div class="src-item"><a href="{escape_html(r["link"])}" target="_blank" '
-                    f'rel="noopener">{escape_html(r["title"])}</a>{new_badge}'
-                    f'<div class="quicklink-note">{escape_html(r["note"])}</div></div>'
-                )
-            parts.append("</div>")
+    # 자동 수집 불가 소스 -> 바로가기 카드
+    parts.append('<div class="src-block"><h3>바로가기 (자동 수집 불가)</h3>')
+    for s in STATIC_LINK_SOURCES:
+        parts.append(
+            f'<div class="src-item quicklink"><a href="{escape_html(s["url"])}" target="_blank" '
+            f'rel="noopener">{escape_html(s["label"])} →</a>'
+            f'<div class="quicklink-note">{escape_html(s["note"])}</div></div>'
+        )
+    parts.append("</div>")
 
     return "\n".join(parts)
 
 
 if __name__ == "__main__":
-    approvals, pmda = collect_approvals()
-    print(f"[INFO] 총 {len(approvals)}건 수집 완료 (PMDA {len(pmda)}건 별도)")
-    html = build_approval_panel_html(approvals, pmda)
+    reports = collect_reports()
+    print(f"[INFO] 총 {len(reports)}건 수집 완료")
+    html = build_report_panel_html(reports)
     os.makedirs("docs", exist_ok=True)
-    with open("docs/_approval_panel_preview.html", "w", encoding="utf-8") as f:
+    with open("docs/_report_panel_preview.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("[INFO] docs/_approval_panel_preview.html 에 미리보기 저장")
+    print("[INFO] docs/_report_panel_preview.html 에 미리보기 저장")
