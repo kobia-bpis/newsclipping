@@ -520,43 +520,57 @@ def escape_html(text):
     )
 
 
+# 항상 표시할 6개 소제목 (수집 성공 여부와 무관하게 항상 나오고, 각각 바로가기 링크를 가진다)
+APPROVAL_SOURCE_META = [
+    {"key": "FDA CBER (생물학적제제)", "home_url": "https://www.fda.gov/vaccines-blood-biologics/news-events-biologics/whats-new-biologics"},
+    {"key": "FDA CDER", "home_url": "https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=reportsSearch.process"},
+    {"key": "EU 신규 허가 (Community Register)", "home_url": EU_SOURCE["url"]},
+    {"key": "국내 생물의약품 허가", "home_url": build_mfds_url("C0", page=1)},
+    {"key": "국내 첨단바이오의약품 허가", "home_url": build_mfds_url("J0", page=1)},
+    {"key": "PMDA (일본)", "home_url": "https://www.pmda.go.jp/0017.html"},
+]
+
+
 def build_approval_panel_html(items, pmda_results):
     grouped = {}
-    order = []
     for item in items:
-        src = item["source"]
-        if src not in grouped:
-            grouped[src] = []
-            order.append(src)
-        grouped[src].append(item)
+        grouped.setdefault(item["source"], []).append(item)
 
     parts = ['<div class="panel-header"><h2>✅ 허가 모니터링</h2></div>']
 
-    if not order and not pmda_results:
-        parts.append('<p class="empty">수집된 허가 정보가 없습니다.</p>')
-    else:
-        for src in order:
-            parts.append('<div class="src-block">')
-            parts.append(f'<h3>{escape_html(src)}</h3>')
-            for item in grouped[src]:
-                new_badge = ' <span class="new-badge">NEW</span>' if item.get("is_new") else ""
-                date_str = f' <span class="date-tag">{escape_html(item["date"])}</span>' if item.get("date") else ""
-                parts.append(
-                    f'<div class="src-item"><a href="{escape_html(item["link"])}" target="_blank" '
-                    f'rel="noopener">{escape_html(item["title"])}</a>{date_str}{new_badge}</div>'
-                )
-            parts.append("</div>")
+    for meta in APPROVAL_SOURCE_META:
+        key = meta["key"]
+        parts.append('<div class="src-block">')
+        parts.append(
+            f'<h3>{escape_html(key)} '
+            f'<a class="quicklink-inline" href="{escape_html(meta["home_url"])}" target="_blank" rel="noopener">바로가기 →</a></h3>'
+        )
 
-        if pmda_results:
-            parts.append('<div class="src-block"><h3>PMDA (일본)</h3>')
-            for r in pmda_results:
-                new_badge = ' <span class="new-badge">갱신됨</span>' if r.get("is_new") else ""
-                parts.append(
-                    f'<div class="src-item"><a href="{escape_html(r["link"])}" target="_blank" '
-                    f'rel="noopener">{escape_html(r["title"])}</a>{new_badge}'
-                    f'<div class="quicklink-note">{escape_html(r["note"])}</div></div>'
-                )
-            parts.append("</div>")
+        if key == "PMDA (일본)":
+            if pmda_results:
+                for r in pmda_results:
+                    new_badge = ' <span class="new-badge">갱신됨</span>' if r.get("is_new") else ""
+                    parts.append(
+                        f'<div class="src-item"><a href="{escape_html(r["link"])}" target="_blank" '
+                        f'rel="noopener">{escape_html(r["title"])}</a>{new_badge}'
+                        f'<div class="quicklink-note">{escape_html(r["note"])}</div></div>'
+                    )
+            else:
+                parts.append('<p class="empty">수집된 정보가 없습니다.</p>')
+        else:
+            src_items = grouped.get(key, [])
+            if src_items:
+                for item in src_items:
+                    new_badge = ' <span class="new-badge">NEW</span>' if item.get("is_new") else ""
+                    date_str = f' <span class="date-tag">{escape_html(item["date"])}</span>' if item.get("date") else ""
+                    parts.append(
+                        f'<div class="src-item"><a href="{escape_html(item["link"])}" target="_blank" '
+                        f'rel="noopener">{escape_html(item["title"])}</a>{date_str}{new_badge}</div>'
+                    )
+            else:
+                parts.append('<p class="empty">최근 수집된 항목이 없습니다.</p>')
+
+        parts.append("</div>")
 
     return "\n".join(parts)
 
