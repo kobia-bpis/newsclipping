@@ -1,208 +1,664 @@
-# 바이오의약품 뉴스클리핑 자동화
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+바이오의약품 뉴스클리핑 자동화 스크립트 (다국어 + 제목 번역 + 웹페이지 버전)
+================================================================
+- Google News RSS로 en-US / ko-KR / ja-JP / zh-CN / en-GB / de-DE 6개 지역 키워드 뉴스 수집
+- 최근 N시간 이내 기사만 필터링
+- 1차: 완전 동일한 제목은 수집 단계에서 즉시 제거
+- 2차: 번역된 제목 기준으로 유사도 비교해 다른 매체/언어로 중복 보도된 기사까지 제거
+- 원문 제목은 그대로 두고, 한국어가 아닌 기사는 무료 번역(API 키 불필요)으로
+  한국어 번역 제목을 함께 표시 (병렬 처리 + 타임아웃 적용)
+- (선택, API 키 있을 때만) 그룹당 최신 N건은 본문 요약도 추가 가능
+- 다이제스트 표시 방식을 최신순 전체 나열(기본) / 국가별 / 키워드별 중 선택 가능 (GROUP_BY)
+- 마크다운 다이제스트 + 스타일이 적용된 HTML 웹페이지 생성
+  (docs/index.html — GitHub Pages로 호스팅하면 매일 접속해서 확인 가능, 아카이브 자동 보관)
+- (선택) 이메일 발송(Gmail/메일플러그 등 SMTP) / Slack Webhook 전송 — 필요 없으면 안 써도 됨
+- cron 또는 GitHub Actions로 매일 자동 실행
 
-Google News RSS 기반으로 키워드별 최신 기사를 매일 수집해 마크다운 다이제스트와
-**스타일이 적용된 웹페이지**를 만드는 스크립트입니다. GitHub Pages로 호스팅하면
-매일 정해진 URL 하나만 즐겨찾기 해두고 접속해서 확인하면 됩니다 (이메일/SMTP 설정 불필요).
-필요하면 Slack/이메일 전송도 선택적으로 켤 수 있습니다.
+사용 전 준비 (기본, API 키 불필요):
+    pip install feedparser requests python-dateutil --break-system-packages
 
-## 1. 설치
+요약 기능까지 쓰려면 (선택, Anthropic API 키 필요):
+    pip install trafilatura anthropic --break-system-packages
+    export ANTHROPIC_API_KEY=sk-ant-xxxx
+    export ENABLE_SUMMARY=1
 
-기본 사용(번역 포함, API 키 불필요):
+환경변수:
+    GROUP_BY                   다이제스트 정렬 방식: recent(기본, 최신순 전체) | country(국가별) | keyword(키워드별)
+    DEDUP_SIMILARITY_THRESHOLD 유사 중복 판단 기준(0~1, 기본 0.82). 낮출수록 더 엄격하게(더 많이) 제거
+    ENABLE_TITLE_TRANSLATION   기본 1 (켜짐), 끄려면 0
+    ENABLE_SUMMARY             기본 0 (꺼짐), API 키 있으면 1로 설정
+    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_TO, MAIL_FROM   (선택, 이메일 발송)
+    SLACK_WEBHOOK_URL                                                (선택, 슬랙 전송)
+"""
 
-```bash
-pip install feedparser requests python-dateutil --break-system-packages
-```
+import os
+import re
+import time
+import json
+import hashlib
+import difflib
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime, timedelta, timezone
 
-- 제목 번역: 원문 제목을 한국어로 번역 (Google Translate 무료 엔드포인트를 직접 호출, API 키 불필요, 6초 타임아웃 적용)
-  - 비공식 엔드포인트라 완전히 안정적이진 않습니다. 번역 실패 시 자동으로 원문 제목만 표시되고
-    전체 실행은 계속 진행됩니다.
-  - 대량으로 자주 호출하면 일시적으로 막힐 수 있으니, 하루 1회 정도의 사용량이면 문제없습니다.
+import feedparser
+import requests
+from dateutil import parser as dateparser
 
-요약 기능은 기본적으로 꺼져 있습니다 (Anthropic API 키가 없으면 사용 안 함).
-나중에 API 키가 생기면 아래처럼 켤 수 있습니다.
+# -----------------------------
+# 1. 설정: 키워드 / 검색 옵션
+# -----------------------------
 
-```bash
-pip install trafilatura anthropic --break-system-packages
-export ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
-export ENABLE_SUMMARY=1
-```
+KEYWORD_GROUPS = {
+    "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁생산"],
+    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant DNA technology"],
+    "세포유전자치료제": ["CAR-T", "CGT", "cell and gene therapy", "AAV"],
+    "항체/치료제 모달리티": ["monoclonal antibody -mab", "Abs biologics", "GLP-1 agonist"],
+    "백신/톡신": ["vaccine biologics", "botulinum toxin"],
+    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval",
+                 "CDE China drug approval", "MFDS 식약처", "HHS biologics policy"],
+}
 
-## 2. 다국어 수집 범위
+# 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
+LANG_REGIONS = [
+    {"hl": "en-US", "gl": "US", "ceid": "US:en"},
+    {"hl": "ko", "gl": "KR", "ceid": "KR:ko"},
+    {"hl": "ja", "gl": "JP", "ceid": "JP:ja"},
+    {"hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
+    {"hl": "en-GB", "gl": "GB", "ceid": "GB:en"},
+    {"hl": "de", "gl": "DE", "ceid": "DE:de"},
+]
 
-현재 4개 지역을 동시에 검색합니다: 미국(en-US), 한국(ko-KR), 일본(ja-JP), 중국(zh-CN, 간체).
-일본/중국 기사는 PMDA·CDE 관련 규제 뉴스나 현지 CDMO/바이오텍 동향을 원문으로 잡기 위한 것입니다.
+LANG_NAMES = {
+    "en-US": "미국", "ko": "한국", "ja": "일본",
+    "zh-CN": "중국", "en-GB": "영국", "de": "독일",
+}
 
-**제목 번역**: 한국어가 아닌 기사는 원문 제목 아래에 "🇰🇷 번역: ..." 형태로 한국어 번역 제목이
-자동으로 함께 표시됩니다(요약과 무관하게 항상 동작). 끄고 싶으면:
+# 다이제스트 표시 방식: "recent"(최신순 전체 나열, 기본) | "country"(국가별 그룹) | "keyword"(기존 키워드별 그룹)
+GROUP_BY = os.environ.get("GROUP_BY", "recent")
 
-```bash
-export ENABLE_TITLE_TRANSLATION=0
-```
+# 유사 중복 기사 제거 기준 (0~1, 높을수록 엄격). 기본 0.82
+DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.82"))
 
-지역을 더 추가하고 싶다면 `LANG_REGIONS`에 `{"hl": "...", "gl": "...", "ceid": "..."}` 형태로 넣으면 됩니다.
-(예: 유럽 EMA 동향이 필요하면 `en-GB`/`GB` 또는 `de`/`DE` 추가)
+LOOKBACK_HOURS = 30
+OUTPUT_DIR = "digests"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-**실행 속도 참고**: RSS 수집(최대 17키워드 × 6지역 ≈ 100여 회)과 제목 번역(기사별 병렬 처리, 최대 8개 동시)에는
-각각 타임아웃이 걸려 있어(RSS 10초, 번역 6초) 특정 요청이 응답 없이 멈춰도 전체가 무한정 늘어지지 않습니다.
-기사 수·지역 수에 따라 보통 2~5분 정도 소요됩니다.
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl={hl}&gl={gl}&ceid={ceid}"
 
-## 3. 요약 기능 (선택, API 키 있을 때만)
+# -----------------------------
+# 2. 요약 / 번역 설정
+# -----------------------------
 
-요약은 기본 꺼져 있습니다. `ENABLE_SUMMARY=1`로 켜면 그룹당 최신 상위 N건만 본문을 가져와
-Claude Haiku로 3줄 요약을 생성합니다(비용 관리를 위한 제한이며, 요약을 안 쓰면 이 제한은
-적용되지 않고 수집된 기사 전체가 다이제스트에 표시됩니다).
+# Claude API 요약 (API 키 있을 때만 사용, 기본 꺼짐)
+ENABLE_SUMMARY = os.environ.get("ENABLE_SUMMARY", "0") == "1"
+SUMMARIZE_TOP_N_PER_GROUP = int(os.environ.get("SUMMARIZE_TOP_N_PER_GROUP", "5"))
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+MAX_ARTICLE_CHARS = 3000
 
-```bash
-export SUMMARIZE_TOP_N_PER_GROUP=8   # 그룹당 요약 개수 조정
-export ANTHROPIC_MODEL=claude-haiku-4-5-20251001  # 필요시 다른 모델로 변경
-```
+# 제목 한국어 번역 (API 키 불필요, 무료 Google Translate 비공식 엔드포인트 사용)
+# 요약과 무관하게 항상 켜짐. 끄고 싶으면 ENABLE_TITLE_TRANSLATION=0
+ENABLE_TITLE_TRANSLATION = os.environ.get("ENABLE_TITLE_TRANSLATION", "1") == "1"
 
-## 4. 키워드 수정
-
-`clip_news.py` 상단의 `KEYWORD_GROUPS` 딕셔너리에서 그룹/키워드를 자유롭게 추가·삭제하세요.
-현재 기본 세팅:
-
-- CDMO / 위탁생산
-- Biologics, Biopharmaceuticals, recombinant DNA technology
-- CAR-T, CGT, AAV
-- 항체 계열(-mab), GLP-1(glutide 계열)
-- 백신, 보툴리눔 톡신
-- 규제기관: FDA(IND 포함), PMDA, CDE, MFDS, HHS
-
-> 참고: 검색 정확도를 위해 `IND FDA`, `FDA approval biologics`처럼 2단어 조합으로 넣었습니다.
-> `IND`, `Abs`, `mab` 처럼 너무 짧거나 일반적인 단어는 노이즈가 많으니 조합형 검색어를 권장합니다.
+_anthropic_client = None
+_translation_cache = {}
 
 
-## 5. 실행
+def get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        from anthropic import Anthropic
+        _anthropic_client = Anthropic()  # ANTHROPIC_API_KEY 환경변수 자동 사용
+    return _anthropic_client
 
-```bash
-python3 clip_news.py
-```
 
-실행하면 다음 두 가지가 생성됩니다.
+def translate_title_to_ko(title, lang):
+    """원문 제목을 한국어로 번역 (API 키 불필요, Google Translate 무료 엔드포인트 직접 호출).
+    이미 한국어면 번역하지 않고 그대로 반환. 실패/타임아웃 시 None 반환 (원문만 표시됨)."""
+    if not ENABLE_TITLE_TRANSLATION:
+        return None
+    if lang == "ko":
+        return None  # 이미 한국어 원문이므로 번역 불필요
 
-- `digests/digest_YYYYMMDD.md` — 마크다운 원본 (git 기록용)
-- `docs/index.html` — **오늘의 다이제스트 웹페이지** (그대로 GitHub Pages로 호스팅)
-- `docs/archive/digest_YYYYMMDD.html` — 지난 다이제스트 아카이브, `docs/archive/index.html`에서 목록 확인 가능
+    if title in _translation_cache:
+        return _translation_cache[title]
 
-로컬에서 결과를 바로 보고 싶으면 `docs/index.html` 파일을 더블클릭해서 브라우저로 열면 됩니다.
+    try:
+        resp = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": title},
+            timeout=6,  # 응답이 느리면 6초 후 포기 (전체 실행이 늘어지는 것 방지)
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        translated = "".join(seg[0] for seg in data[0] if seg[0])
+        _translation_cache[title] = translated
+        return translated
+    except Exception as e:
+        print(f"[WARN] 제목 번역 실패 ({title[:30]}...): {e}")
+        return None
 
-## 6. 매일 자동 실행 + 웹페이지로 확인 — GitHub Pages (추천, 무료)
 
-가장 간단한 구성입니다: GitHub Actions가 매일 새벽에 스크립트를 실행해서 `docs/` 폴더를
-레포에 커밋하면, GitHub Pages가 그 폴더를 자동으로 웹사이트로 서빙합니다.
+# -----------------------------
+# 3. 수집
+# -----------------------------
 
-### 6-1. 리포지토리 준비
+def build_url(keyword, lang_region):
+    query = requests.utils.quote(f'"{keyword}" when:2d')
+    return GOOGLE_NEWS_RSS.format(query=query, **lang_region)
 
-1. GitHub에 새 저장소를 만들고 (private도 가능) 이 폴더의 파일들을 올립니다.
-2. 저장소 **Settings → Pages** 로 이동합니다.
-3. **Source**를 "Deploy from a branch"로, **Branch**를 `main` / 폴더는 `/docs`로 지정하고 저장합니다.
-4. 잠시 후 `https://[깃허브아이디].github.io/[저장소이름]/` 주소가 활성화됩니다 — 이 주소를 즐겨찾기 하세요.
 
-### 6-2. 매일 자동 실행 워크플로우
+def fetch_keyword_articles(keyword, lang_region):
+    url = build_url(keyword, lang_region)
+    try:
+        # feedparser 자체는 타임아웃 옵션이 없어서, requests로 먼저 받아온 뒤 파싱
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        feed = feedparser.parse(resp.content)
+    except Exception as e:
+        print(f"[WARN] RSS 요청 타임아웃/실패 ({keyword}, {lang_region['hl']}): {e}")
+        return []
 
-`.github/workflows/daily-clip.yml` 파일을 추가합니다:
+    articles = []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
 
-```yaml
-name: Daily Bio News Clipping
+    for entry in feed.entries:
+        try:
+            published = dateparser.parse(entry.published)
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
 
-on:
-  schedule:
-    - cron: '0 23 * * *'   # UTC 23:00 = 한국시간 08:00
-  workflow_dispatch: {}     # 수동 실행 버튼도 활성화
+        if published < cutoff:
+            continue
 
-jobs:
-  clip:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install feedparser requests python-dateutil
-      - run: python3 clip_news.py
-      - name: Commit digest & webpage to repo
-        run: |
-          git config user.name "news-bot"
-          git config user.email "bot@example.com"
-          git add digests/ docs/
-          git commit -m "Daily digest $(date +%Y-%m-%d)" || echo "no changes"
-          git push
-```
+        source = entry.get("source", {}).get("title", "") if hasattr(entry, "get") else ""
+        articles.append({
+            "title": entry.title,
+            "link": entry.link,
+            "published": published,
+            "source": source,
+            "keyword": keyword,
+            "lang": lang_region["hl"],
+        })
+    return articles
 
-- `workflow_dispatch`가 있어서 Actions 탭에서 "Run workflow" 버튼으로 바로 테스트 실행도 가능합니다.
-- 매일 커밋되면 GitHub Pages가 몇 분 내로 자동 갱신되고, 즐겨찾기한 주소에서 항상 "오늘 것"이 보입니다.
-- Repository가 Private이어도 GitHub Pages는 (개인/Pro 계정 기준) 그대로 동작합니다. 다만 Pages로 배포된 페이지 자체는 공개 URL이라는 점은 참고하세요 — 민감한 내용이 없다면 문제 없습니다.
 
-## 7. (선택) 이메일/Slack도 함께 받고 싶다면
+def normalize_title(title):
+    t = re.sub(r"\s*-\s*[^-]+$", "", title)
+    t = re.sub(r"[^\w\s]", "", t).lower().strip()
+    return t
 
-웹페이지 확인이 기본이지만, 필요하면 이메일·Slack 전송도 추가로 켤 수 있습니다.
-`SMTP_*` 또는 `SLACK_WEBHOOK_URL` 환경변수를 설정하면 자동으로 함께 전송됩니다 (설정 안 하면 조용히 건너뜁니다).
 
-**메일플러그(kobia.kr) 사용 예시** — 포트는 465(SSL) 고정이며, 그룹웨어 로그인 비밀번호가 아니라
-별도로 발급받는 "앱 비밀번호"를 써야 합니다 (`login.mailplug.com` → 환경설정 → 앱 비밀번호):
+def collect_all():
+    all_articles = []
+    seen_hashes = set()
 
-```bash
-export SMTP_HOST=smtp.mailplug.co.kr
-export SMTP_PORT=465
-export SMTP_USER=sohk@kobia.kr
-export SMTP_PASS=발급받은_앱비밀번호
-export MAIL_TO=sohk@kobia.kr
-```
+    for group, keywords in KEYWORD_GROUPS.items():
+        for kw in keywords:
+            for lr in LANG_REGIONS:
+                try:
+                    arts = fetch_keyword_articles(kw, lr)
+                except Exception as e:
+                    print(f"[WARN] {kw} ({lr['hl']}) 수집 실패: {e}")
+                    continue
 
-Gmail을 쓰는 경우 (포트 587, STARTTLS):
+                for a in arts:
+                    key = hashlib.md5(normalize_title(a["title"]).encode()).hexdigest()
+                    if key in seen_hashes:
+                        continue
+                    seen_hashes.add(key)
+                    a["group"] = group
+                    all_articles.append(a)
 
-```bash
-export SMTP_HOST=smtp.gmail.com
-export SMTP_PORT=587
-export SMTP_USER=your_email@gmail.com
-export SMTP_PASS=앱비밀번호
-export MAIL_TO=받을주소@company.com
-```
+                time.sleep(0.4)
 
-스크립트는 포트가 465면 자동으로 SSL 방식, 그 외(587 등)는 STARTTLS 방식으로 접속합니다.
+    return all_articles
 
-GitHub Actions에서 이메일/Slack까지 함께 쓰려면 워크플로우의 `env`에 아래를 추가하세요
-(Settings → Secrets and variables → Actions 에 값 등록 필요):
 
-```yaml
-      - run: python3 clip_news.py
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-```
+# -----------------------------
+# 4. 본문 추출 + 요약
+# -----------------------------
 
-## 8. 매일 자동 실행 — 방법 B: 로컬/서버 cron (Linux/Mac)
+def resolve_real_url(google_news_url):
+    """Google News RSS 링크(리다이렉트)를 실제 언론사 URL로 변환"""
+    try:
+        resp = requests.get(
+            google_news_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+            allow_redirects=True,
+        )
+        return resp.url
+    except Exception:
+        return google_news_url
 
-GitHub 대신 개인 서버나 상시 켜진 PC에서 돌리고 싶다면:
 
-```bash
-crontab -e
-```
+def extract_article_text(url):
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return None
+        text = trafilatura.extract(downloaded)
+        return text
+    except Exception:
+        return None
 
-아래 줄 추가 (매일 오전 8시 실행):
 
-```
-0 8 * * * cd /path/to/bio_news_clipper && /usr/bin/python3 clip_news.py >> run.log 2>&1
-```
+def summarize_ko(title, text, lang):
+    """제목+본문을 받아 한국어 3줄 요약 생성 (실패 시 None)"""
+    if not ENABLE_SUMMARY:
+        return None
+    try:
+        client = get_anthropic_client()
+        body = (text or "")[:MAX_ARTICLE_CHARS]
+        prompt = (
+            "다음은 바이오의약품 관련 뉴스 기사입니다. "
+            "핵심 내용을 한국어로 3줄 이내 불릿으로 간결하게 요약해줘. "
+            "불필요한 서론 없이 요약만 출력해.\n\n"
+            f"[제목]\n{title}\n\n[본문]\n{body if body else '(본문 추출 실패, 제목만으로 추정 요약)'}"
+        )
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        parts = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
+        return "\n".join(parts).strip() or None
+    except Exception as e:
+        print(f"[WARN] 요약 실패 ({title[:30]}...): {e}")
+        return None
 
-이 경우 `docs/index.html`을 로컬 웹서버(`python3 -m http.server` 등)로 열거나,
-Dropbox/OneDrive 동기화 폴더에 두고 브라우저 즐겨찾기(`file:///...`)로 열어도 됩니다.
 
-- 나중에 요약 기능을 켜려면 `ANTHROPIC_API_KEY` 환경변수(또는 GitHub Secret)를 추가하고,
-  install 줄에 `trafilatura anthropic`을 더하고, `ENABLE_SUMMARY=1`을 설정하면 됩니다.
+def enrich_with_translations(articles):
+    """전체 기사 대상으로 제목 번역만 수행 (본문 요약과 무관, N건 제한 없음).
+    번역 대상 기사가 많아도 병렬로 처리해 전체 실행 시간을 단축한다."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-## 9. 고도화 아이디어
+    targets = [a for a in articles if a["lang"] != "ko"]
+    if not targets:
+        return articles
 
-- **중요도 필터**: 특정 언론사(FiercePharma, Endpoints News, BioPharma Dive, 팜뉴스, 메디게이트 등)
-  가중치를 줘서 상단에 노출.
-- **경쟁사/파이프라인 트래킹**: 키워드에 특정 회사명·약물명을 추가해 개별 모니터링.
-- **DB 적재**: Notion API/Google Sheets API로 다이제스트를 자동 기록해 검색 가능한 아카이브 구축.
-- **번역 품질 개선**: 일본어/중국어 원문 제목도 한국어로 병기하고 싶다면 요약 프롬프트에
-  "제목도 한국어로 번역해서 함께 출력" 지시를 추가하면 됩니다.
-- **웹페이지 꾸미기**: `clip_news.py`의 `HTML_STYLE` 안 CSS 변수(`--accent`, `--bg` 등)만 바꿔도
-  색상 테마를 손쉽게 바꿀 수 있습니다.
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_article = {
+            executor.submit(translate_title_to_ko, a["title"], a["lang"]): a
+            for a in targets
+        }
+        for future in as_completed(future_to_article):
+            a = future_to_article[future]
+            try:
+                a["title_ko"] = future.result()
+            except Exception:
+                a["title_ko"] = None
+
+    return articles
+
+
+def dedup_norm(text):
+    """중복 비교용 정규화: 언론사 접미사 제거, 특수문자 제거, 소문자화"""
+    t = re.sub(r"\s*[-–|]\s*[^-–|]{1,30}$", "", text)  # " - 연합뉴스" 같은 접미사 제거
+    t = re.sub(r"[^\w\s]", "", t)
+    t = re.sub(r"\s+", " ", t).strip().lower()
+    return t
+
+
+def dedup_similar_articles(articles, threshold=None):
+    """같은 사건을 다룬 유사 기사(다른 매체·다른 언어로 중복 보도된 경우)를 제거한다.
+    번역된 한국어 제목이 있으면 그걸 기준으로 비교해 언어가 달라도 잡아낸다.
+    최신 기사를 우선 유지하고, 이미 채택된 기사들과 유사도(0~1)가 threshold 이상이면 제거."""
+    if threshold is None:
+        threshold = DEDUP_SIMILARITY_THRESHOLD
+
+    articles_sorted = sorted(articles, key=lambda x: x["published"], reverse=True)
+    kept = []
+    kept_norms = []
+    removed = 0
+
+    for a in articles_sorted:
+        key_text = a.get("title_ko") or a["title"]
+        norm = dedup_norm(key_text)
+        is_dup = False
+        for kn in kept_norms:
+            if difflib.SequenceMatcher(None, norm, kn).ratio() >= threshold:
+                is_dup = True
+                break
+        if is_dup:
+            removed += 1
+            continue
+        kept.append(a)
+        kept_norms.append(norm)
+
+    if removed:
+        print(f"[INFO] 유사 중복 기사 {removed}건 제거 (유사도 기준 {threshold})")
+    return kept
+
+
+def enrich_with_summaries(articles):
+    """그룹별 최신 N개 기사에 대해서만 본문 추출 + 요약 수행 (비용 관리)"""
+    grouped = {}
+    for a in articles:
+        grouped.setdefault(a["group"], []).append(a)
+
+    for group, arts in grouped.items():
+        arts_sorted = sorted(arts, key=lambda x: x["published"], reverse=True)
+        for a in arts_sorted[:SUMMARIZE_TOP_N_PER_GROUP]:
+            real_url = resolve_real_url(a["link"])
+            text = extract_article_text(real_url)
+            a["summary"] = summarize_ko(a["title"], text, a["lang"])
+
+    return articles
+
+
+# -----------------------------
+# 5. 다이제스트 생성
+# -----------------------------
+
+def organize_articles(articles):
+    """GROUP_BY 설정에 따라 (섹션 제목 또는 None, 기사 리스트) 튜플 리스트를 반환.
+    - "recent": 그룹 없이 전체를 최신순으로 나열 (섹션 제목 None)
+    - "country": 국가/지역별로 묶어서, 각 그룹 내부는 최신순
+    - "keyword": 기존 방식(키워드 그룹별)"""
+    if GROUP_BY == "keyword":
+        grouped = {}
+        for a in articles:
+            grouped.setdefault(a["group"], []).append(a)
+        return [
+            (g, sorted(grouped.get(g, []), key=lambda x: x["published"], reverse=True))
+            for g in KEYWORD_GROUPS
+        ]
+
+    if GROUP_BY == "country":
+        order = [LANG_NAMES.get(lr["hl"], lr["hl"]) for lr in LANG_REGIONS]
+        grouped = {name: [] for name in order}
+        for a in articles:
+            name = LANG_NAMES.get(a["lang"], a["lang"])
+            grouped.setdefault(name, []).append(a)
+            if name not in order:
+                order.append(name)
+        return [
+            (name, sorted(grouped[name], key=lambda x: x["published"], reverse=True))
+            for name in order
+        ]
+
+    # 기본값: "recent" — 그룹 없이 최신순 전체 나열
+    return [(None, sorted(articles, key=lambda x: x["published"], reverse=True))]
+
+
+def build_markdown(articles):
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"# 바이오의약품 뉴스클리핑 - {today}\n"]
+    lines.append(f"(최근 {LOOKBACK_HOURS}시간 이내, 총 {len(articles)}건 · 6개 지역: 미국/한국/일본/중국/영국/독일)\n")
+
+    for title, arts in organize_articles(articles):
+        if not arts:
+            continue
+        if title is not None:
+            lines.append(f"\n## {title} ({len(arts)}건)\n")
+        for a in arts:
+            pub_str = a["published"].strftime("%Y-%m-%d %H:%M UTC")
+            src = f" - {a['source']}" if a["source"] else ""
+            lang_tag = f" [{a['lang']}]"
+            lines.append(f"- **[{a['title']}]({a['link']})**{src} ({pub_str}){lang_tag} `[{a['keyword']}]`")
+            if a.get("title_ko"):
+                lines.append(f"  - 🇰🇷 번역: {a['title_ko']}")
+            if a.get("summary"):
+                for sline in a["summary"].splitlines():
+                    if sline.strip():
+                        lines.append(f"  > {sline.strip()}")
+
+    return "\n".join(lines)
+
+
+def save_markdown(md_text):
+    today = datetime.now().strftime("%Y%m%d")
+    path = os.path.join(OUTPUT_DIR, f"digest_{today}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+    print(f"[INFO] 다이제스트 저장: {path}")
+    return path
+
+
+# -----------------------------
+# 5-1. 웹페이지(HTML) 생성 — GitHub Pages용
+# -----------------------------
+
+HTML_DIR = "docs"                       # GitHub Pages 기본 소스 폴더
+HTML_ARCHIVE_DIR = os.path.join(HTML_DIR, "archive")
+os.makedirs(HTML_ARCHIVE_DIR, exist_ok=True)
+
+HTML_STYLE = """
+<style>
+  :root { --accent:#2563eb; --bg:#f7f8fa; --card:#ffffff; --text:#1f2430; --muted:#6b7280; --border:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Malgun Gothic",sans-serif;
+         background:var(--bg); color:var(--text); line-height:1.55; }
+  .wrap { max-width:820px; margin:0 auto; padding:28px 20px 80px; }
+  header { margin-bottom:24px; }
+  header h1 { font-size:22px; margin:0 0 6px; }
+  header .meta { color:var(--muted); font-size:13px; }
+  header .meta a { color:var(--accent); text-decoration:none; }
+  .group { background:var(--card); border:1px solid var(--border); border-radius:10px;
+           padding:16px 18px; margin-bottom:16px; }
+  .group h2 { font-size:16px; margin:0 0 12px; display:flex; justify-content:space-between; align-items:center; }
+  .group h2 .count { font-weight:400; color:var(--muted); font-size:13px; }
+  .item { padding:10px 0; border-top:1px solid var(--border); }
+  .item:first-child { border-top:none; padding-top:0; }
+  .item a.title { font-size:14.5px; font-weight:600; color:var(--text); text-decoration:none; }
+  .item a.title:hover { color:var(--accent); }
+  .item .sub { font-size:12px; color:var(--muted); margin-top:3px; }
+  .item .translated { font-size:13px; color:#0d6b3f; margin-top:4px; }
+  .item .summary { font-size:13px; color:#374151; margin-top:6px; background:#f3f4f6;
+                    border-radius:6px; padding:8px 10px; }
+  .tag { display:inline-block; background:#eef2ff; color:var(--accent); border-radius:5px;
+         padding:1px 6px; font-size:11px; margin-left:4px; }
+  .empty { color:var(--muted); font-size:13px; }
+  footer { margin-top:32px; color:var(--muted); font-size:12px; text-align:center; }
+  footer a { color:var(--accent); }
+</style>
+"""
+
+
+def escape_html(text):
+    return (
+        (text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def build_html(articles):
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    sections_data = organize_articles(articles)
+
+    sections = []
+    for title, arts in sections_data:
+        sections.append('<div class="group">')
+        if title is not None:
+            sections.append(
+                f'<h2>{escape_html(title)} <span class="count">{len(arts)}건</span></h2>'
+            )
+        if not arts:
+            sections.append('<p class="empty">최근 수집된 기사가 없습니다.</p>')
+        else:
+            for a in arts:
+                pub_str = a["published"].strftime("%Y-%m-%d %H:%M UTC")
+                src = f" · {escape_html(a['source'])}" if a["source"] else ""
+                country = LANG_NAMES.get(a["lang"], a["lang"])
+                sections.append('<div class="item">')
+                sections.append(
+                    f'<a class="title" href="{escape_html(a["link"])}" target="_blank" rel="noopener">'
+                    f'{escape_html(a["title"])}</a>'
+                )
+                sections.append(
+                    f'<div class="sub">{pub_str}{src} · {escape_html(country)} '
+                    f'<span class="tag">{escape_html(a["keyword"])}</span></div>'
+                )
+                if a.get("title_ko"):
+                    sections.append(f'<div class="translated">🇰🇷 {escape_html(a["title_ko"])}</div>')
+                if a.get("summary"):
+                    sections.append(
+                        f'<div class="summary">{escape_html(a["summary"]).replace(chr(10), "<br>")}</div>'
+                    )
+                sections.append("</div>")
+        sections.append("</div>")
+
+    body = "\n".join(sections)
+
+    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>바이오의약품 뉴스클리핑 - {today_str}</title>
+{HTML_STYLE}
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>바이오의약품 뉴스클리핑</h1>
+    <div class="meta">{today_str} 업데이트 · 최근 {LOOKBACK_HOURS}시간 · 총 {len(articles)}건 ·
+      <a href="archive/">지난 다이제스트 보기</a>
+    </div>
+  </header>
+  {body}
+  <footer>매일 자동 수집 · Google News RSS 기반 · 무료 번역(Google Translate)</footer>
+</div>
+</body>
+</html>"""
+    return html
+
+
+def build_archive_index():
+    """archive 폴더 안의 과거 다이제스트 목록 페이지 생성"""
+    files = sorted(
+        [f for f in os.listdir(HTML_ARCHIVE_DIR) if f.startswith("digest_") and f.endswith(".html")],
+        reverse=True,
+    )
+    items = "\n".join(
+        f'<li><a href="{f}">{f.replace("digest_", "").replace(".html", "")}</a></li>' for f in files
+    )
+    html = f"""<!DOCTYPE html>
+<html lang="ko">
+<head><meta charset="UTF-8"><title>지난 다이제스트</title>
+<style>body{{font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px;}}
+a{{color:#2563eb;text-decoration:none;}} li{{margin:6px 0;}}</style></head>
+<body>
+<h2>지난 다이제스트 목록</h2>
+<p><a href="../">← 오늘 다이제스트로</a></p>
+<ul>
+{items}
+</ul>
+</body></html>"""
+    with open(os.path.join(HTML_ARCHIVE_DIR, "index.html"), "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+def save_html(html_text):
+    today = datetime.now().strftime("%Y%m%d")
+    # 오늘자 최신 페이지 (GitHub Pages 루트 index.html — 접속 시 항상 최신)
+    index_path = os.path.join(HTML_DIR, "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+    # 아카이브에도 동일한 내용 보관
+    archive_path = os.path.join(HTML_ARCHIVE_DIR, f"digest_{today}.html")
+    with open(archive_path, "w", encoding="utf-8") as f:
+        f.write(html_text)
+    build_archive_index()
+    # GitHub Pages가 Jekyll로 재가공하지 않고 정적 파일 그대로 서빙하도록 설정
+    nojekyll_path = os.path.join(HTML_DIR, ".nojekyll")
+    if not os.path.exists(nojekyll_path):
+        open(nojekyll_path, "w").close()
+    print(f"[INFO] 웹페이지 저장: {index_path} (아카이브: {archive_path})")
+    return index_path
+
+
+# -----------------------------
+# 6. (선택) 전송
+# -----------------------------
+
+def send_email(md_text):
+    host = os.environ.get("SMTP_HOST")
+    if not host:
+        return
+
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    user = os.environ["SMTP_USER"]
+    pw = os.environ["SMTP_PASS"]
+    to_addr = os.environ["MAIL_TO"]
+    from_addr = os.environ.get("MAIL_FROM", user)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"[바이오의약품 뉴스클리핑] {datetime.now().strftime('%Y-%m-%d')}"
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+    msg.attach(MIMEText(md_text, "plain", "utf-8"))
+
+    if port == 465:
+        # SSL 방식 (메일플러그 등 대부분의 기업 메일이 여기 해당)
+        with smtplib.SMTP_SSL(host, port) as server:
+            if os.environ.get("SMTP_DEBUG") == "1":
+                server.set_debuglevel(1)
+            server.login(user, pw)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+    else:
+        # STARTTLS 방식 (Gmail 587 등)
+        with smtplib.SMTP(host, port) as server:
+            if os.environ.get("SMTP_DEBUG") == "1":
+                server.set_debuglevel(1)
+            server.starttls()
+            server.login(user, pw)
+            server.sendmail(from_addr, [to_addr], msg.as_string())
+    print("[INFO] 이메일 발송 완료")
+
+
+def send_slack(md_text):
+    webhook = os.environ.get("SLACK_WEBHOOK_URL")
+    if not webhook:
+        return
+    payload = {"text": md_text[:3800]}
+    requests.post(webhook, data=json.dumps(payload),
+                  headers={"Content-Type": "application/json"})
+    print("[INFO] Slack 전송 완료")
+
+
+# -----------------------------
+# 7. 메인
+# -----------------------------
+
+def main():
+    print("[INFO] 뉴스 수집 시작 (미국/한국/일본/중국/영국/독일)...")
+    articles = collect_all()
+    print(f"[INFO] 수집 완료: {len(articles)}건 (완전 동일 제목 제거 후)")
+
+    if ENABLE_TITLE_TRANSLATION:
+        print("[INFO] 원문 기사 제목 한국어 번역 중...")
+        articles = enrich_with_translations(articles)
+
+    print("[INFO] 유사 중복 기사 제거 중...")
+    articles = dedup_similar_articles(articles)
+    print(f"[INFO] 최종 기사 수: {len(articles)}건")
+
+    if ENABLE_SUMMARY:
+        print(f"[INFO] 그룹별 최신 {SUMMARIZE_TOP_N_PER_GROUP}건 요약 생성 중...")
+        articles = enrich_with_summaries(articles)
+
+    md_text = build_markdown(articles)
+    save_markdown(md_text)
+
+    html_text = build_html(articles)
+    save_html(html_text)
+
+    send_email(md_text)
+    send_slack(md_text)
+
+    print("[INFO] 완료")
+
+
+if __name__ == "__main__":
+    main()
