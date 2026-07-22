@@ -149,6 +149,19 @@ def build_url(keyword, lang_region):
     query = requests.utils.quote(f'"{keyword}" when:2d')
     return GOOGLE_NEWS_RSS.format(query=query, **lang_region)
 
+def strip_source_suffix(title, source):
+    """Google News RSS 제목 끝에 자동으로 붙는 " - 언론사명"을 제거.
+    출처(source)가 있으면 정확히 일치하는 접미사부터 우선 제거하고,
+    못 찾으면 일반적인 트레일링 " - XXX" 패턴으로 한 번 더 시도한다."""
+    if source:
+        suffix = f" - {source}"
+        if title.endswith(suffix):
+            return title[: -len(suffix)].rstrip()
+ 
+    m = re.search(r"\s*[-–]\s*[^-–]{1,40}$", title)
+    if m:
+        return title[: m.start()].rstrip()
+    return title
 
 def fetch_keyword_articles(keyword, lang_region):
     url = build_url(keyword, lang_region)
@@ -159,10 +172,10 @@ def fetch_keyword_articles(keyword, lang_region):
     except Exception as e:
         print(f"[WARN] RSS 요청 타임아웃/실패 ({keyword}, {lang_region['hl']}): {e}")
         return []
-
+ 
     articles = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-
+ 
     for entry in feed.entries:
         try:
             published = dateparser.parse(entry.published)
@@ -170,13 +183,14 @@ def fetch_keyword_articles(keyword, lang_region):
                 published = published.replace(tzinfo=timezone.utc)
         except Exception:
             continue
-
+ 
         if published < cutoff:
             continue
-
+ 
         source = entry.get("source", {}).get("title", "") if hasattr(entry, "get") else ""
+        clean_title = strip_source_suffix(entry.title, source)
         articles.append({
-            "title": entry.title,
+            "title": clean_title,
             "link": entry.link,
             "published": published,
             "source": source,
@@ -184,7 +198,6 @@ def fetch_keyword_articles(keyword, lang_region):
             "lang": lang_region["hl"],
         })
     return articles
-
 
 def normalize_title(title):
     t = re.sub(r"\s*-\s*[^-]+$", "", title)
