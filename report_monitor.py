@@ -23,7 +23,12 @@ from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
 SEEN_STATE_PATH = "docs/seen_reports.json"
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReportMonitorBot/1.0; +https://github.com)"}
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+}
 REQUEST_TIMEOUT = 12
 
 # 보고서 발간일/업로드일 추출용 날짜 패턴 (링크 주변 텍스트에서 찾는다 - 사이트마다 형식이 달라 베스트 에포트)
@@ -34,22 +39,35 @@ DATE_PATTERNS = [
 ]
 
 
-def find_nearby_date(tag, max_levels=4):
-    """링크 태그 주변(부모 요소들)의 텍스트에서 날짜로 보이는 문자열을 찾아 YYYY-MM-DD로 반환.
-    사이트마다 날짜 위치·형식이 달라 100% 정확하지는 않은 베스트 에포트 방식."""
+def find_nearby_date(tag, max_levels=7):
+    """링크 태그 주변(부모 요소들 + 그 형제 요소들)의 텍스트에서 날짜로 보이는 문자열을 찾아
+    YYYY-MM-DD로 반환. 사이트마다 날짜 위치·형식이 달라 100% 정확하지는 않은 베스트 에포트 방식."""
     node = tag
     for _ in range(max_levels):
         if node is None:
             break
-        text = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
-        for pat in DATE_PATTERNS:
-            m = re.search(pat, text)
-            if m:
-                try:
-                    dt = dateparser.parse(m.group(0), fuzzy=True)
-                    return dt.strftime("%Y-%m-%d")
-                except Exception:
-                    pass
+
+        candidates = [node]
+        # 카드형 레이아웃은 날짜가 형제 요소(예: <span class="date">)에 따로 있는 경우가 많다
+        if hasattr(node, "find_previous_sibling"):
+            prev_sib = node.find_previous_sibling()
+            next_sib = node.find_next_sibling()
+            if prev_sib is not None:
+                candidates.append(prev_sib)
+            if next_sib is not None:
+                candidates.append(next_sib)
+
+        for cand in candidates:
+            text = cand.get_text(" ", strip=True) if hasattr(cand, "get_text") else ""
+            for pat in DATE_PATTERNS:
+                m = re.search(pat, text)
+                if m:
+                    try:
+                        dt = dateparser.parse(m.group(0), fuzzy=True)
+                        return dt.strftime("%Y-%m-%d")
+                    except Exception:
+                        pass
+
         node = node.parent
     return None
 
@@ -140,6 +158,13 @@ def save_seen(seen_links):
         json.dump(sorted(seen_links), f, ensure_ascii=False)
 
 
+GENERIC_LINK_TEXTS = {
+    "read more", "learn more", "see latest reports", "read the featured report",
+    "explore more", "view all", "see all", "click here", "discover", "see more",
+    "download", "download report", "download now", "find out more",
+}
+
+
 def scrape_by_href_pattern(source):
     """href URL 패턴으로 보고서 링크를 찾는 범용 스크래퍼.
     CSS 클래스명에 의존하지 않아 사이트 디자인이 바뀌어도 비교적 안전하다."""
@@ -166,6 +191,8 @@ def scrape_by_href_pattern(source):
         title = a.get_text(strip=True)
         if not title or len(title) < 4:
             continue
+        if title.strip().lower() in GENERIC_LINK_TEXTS:
+            continue  # "READ MORE" 같은 버튼 문구는 실제 제목이 아니므로 제외
         full_link = href if href.startswith("http") else requests.compat.urljoin(source["url"], href)
         if full_link in exclude_exact or full_link in seen_links:
             continue
