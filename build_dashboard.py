@@ -65,7 +65,8 @@ DASHBOARD_STYLE = """
   .src-block { margin-bottom:16px; }
   .src-block:last-child { margin-bottom:0; }
   .src-block h3 { font-size:13px; color:var(--muted); margin:0 0 8px; text-transform:uppercase;
-                  letter-spacing:.02em; border-bottom:1px solid var(--border); padding-bottom:6px; }
+                  letter-spacing:.02em; border-bottom:1px solid var(--border); padding-bottom:6px;
+                  display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .src-item { padding:6px 0; font-size:13.5px; }
   .src-item a { color:var(--text); text-decoration:none; font-weight:500; }
   .src-item a:hover { color:var(--accent); }
@@ -73,6 +74,9 @@ DASHBOARD_STYLE = """
                border-radius:4px; padding:1px 5px; margin-left:5px; vertical-align:middle; }
   .date-tag { color:var(--muted); font-size:11.5px; margin-left:4px; }
   .quicklink-note { color:var(--muted); font-size:11.5px; margin-top:2px; }
+  .quicklink-inline { color:var(--accent); font-size:11px; font-weight:600; text-transform:none;
+                      letter-spacing:normal; text-decoration:none; white-space:nowrap; }
+  .quicklink-inline:hover { text-decoration:underline; }
 
   footer { margin-top:32px; color:var(--muted); font-size:12px; text-align:center; }
   footer a { color:var(--accent); }
