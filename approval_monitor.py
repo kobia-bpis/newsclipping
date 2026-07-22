@@ -270,61 +270,80 @@ def scrape_mfds(source, limit=10):
 
 
 # -----------------------------
-# 5. EU 의약품 허가 - EMA "What's New" (안정적)
+# 5. EU 의약품 신규 허가 - Community Register (Playwright 필요)
 # -----------------------------
-# 참고: 사용자가 처음 제시한 ec.europa.eu/health/documents/community-register 는
-# EU가 사이트를 commission.europa.eu로 통합 이전하면서 껍데기만 남고 실제 목록이
-# 사라진 상태(브라우저에서 열면 commission.europa.eu/index_en로 넘어감).
-# 대신 EMA(유럽의약품청)의 "What's New" 피드가 실제로 작동하는 정적 테이블이라
-# 이쪽으로 교체했다. Type이 "Medicine"인 항목만 필터링한다.
-# 주의: 이 피드는 신규 허가와 기존 의약품의 라벨 변경 등 갱신을 구분하지 않고
-# 모두 "Medicine" 항목으로 묶어서 보여준다 — 100% 신규 허가만은 아님.
+# 이 페이지는 자바스크립트로 데이터를 비동기로 불러와 그리는 방식이라(DataTables류),
+# requests만으로는 빈 껍데기만 받아진다(실제 브라우저에서는 정상적으로 표가 보임).
+# 실제 브라우저처럼 렌더링해야 하므로 Playwright(헤드리스 Chromium)를 사용한다.
+#
+# "Decision type" 컬럼이 정확히 "Centralised - Authorisation"인 행만 추려서
+# 신규 허가만 가져온다 (Variation·Renewal·Withdrawal 등은 제외).
 
 EU_SOURCE = {
-    "label": "EU 의약품 정보 갱신 (EMA)",
-    "url": "https://www.ema.europa.eu/en/news-events/whats-new",
+    "label": "EU 신규 허가 (Community Register)",
+    "url": "https://ec.europa.eu/health/documents/community-register/html/reg_last.htm",
 }
 
 
-def scrape_eu(limit=15):
+def scrape_eu_playwright(limit=20):
     label = EU_SOURCE["label"]
     try:
-        resp = fetch(EU_SOURCE["url"])
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"[WARN] {label} 요청 실패: {e}")
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print(f"[WARN] {label}: playwright가 설치되어 있지 않아 건너뜁니다 "
+              f"(pip install playwright && playwright install --with-deps chromium 필요)")
         return []
-
-    tables = soup.find_all("table")
-    if not tables:
-        print(f"[WARN] {label}: 테이블을 찾지 못함 (페이지 구조 확인 필요)")
-        return []
-    target = max(tables, key=lambda t: len(t.find_all("tr")))
 
     items = []
-    for row in target.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        if len(cells) < 2:
-            continue
-        date_text = cells[0].get_text(strip=True)
-        content_cell = cells[1]
-        type_tag = content_cell.find("strong") or content_cell.find("b")
-        content_type = type_tag.get_text(strip=True).rstrip(":") if type_tag else ""
-        if content_type != "Medicine":
-            continue  # 의약품 항목만 (문서·이벤트·PIP·Orphan 등은 제외)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(EU_SOURCE["url"], timeout=30000, wait_until="networkidle")
+            page.wait_for_selector("table tr", timeout=15000)
 
-        link_tag = content_cell.find("a")
-        if not link_tag:
-            continue
-        title = link_tag.get_text(strip=True)
-        href = link_tag.get("href", "")
-        full_link = href if href.startswith("http") else "https://www.ema.europa.eu" + href
-        items.append({"date": date_text, "title": title, "link": full_link, "source": label})
-        if len(items) >= limit:
-            break
+            # 헤더 텍스트로 컬럼 위치를 동적으로 찾는다 (사이트 구조가 조금 바뀌어도 안전하도록)
+            header_cells = page.query_selector_all("table thead tr th") or page.query_selector_all("table tr:first-of-type th")
+            headers = [h.inner_text().strip().lower() for h in header_cells]
 
-    print(f"[INFO] {label}: {len(items)}건 수집 (Medicine 항목만 필터)")
+            def find_idx(keyword):
+                for i, h in enumerate(headers):
+                    if keyword in h:
+                        return i
+                return None
+
+            idx_product = find_idx("product")
+            idx_type = find_idx("decision type")
+            idx_date = find_idx("decision date")
+
+            rows = page.query_selector_all("table tbody tr") or page.query_selector_all("table tr")
+            for row in rows:
+                cells = row.query_selector_all("td")
+                if not cells or idx_type is None or idx_type >= len(cells):
+                    continue
+                decision_type = cells[idx_type].inner_text().strip()
+                if decision_type != "Centralised - Authorisation":
+                    continue  # 신규 허가만 (Variation/Renewal/Withdrawal 등 제외)
+
+                product_cell = cells[idx_product] if idx_product is not None and idx_product < len(cells) else cells[0]
+                link_el = product_cell.query_selector("a")
+                title = (link_el.inner_text() if link_el else product_cell.inner_text()).strip()
+                if not title:
+                    continue
+                href = link_el.get_attribute("href") if link_el else None
+                full_link = href if (href and href.startswith("http")) else EU_SOURCE["url"]
+                date_text = cells[idx_date].inner_text().strip() if idx_date is not None and idx_date < len(cells) else ""
+
+                items.append({"date": date_text, "title": title, "link": full_link, "source": label})
+                if len(items) >= limit:
+                    break
+
+            browser.close()
+    except Exception as e:
+        print(f"[WARN] {label} 수집 실패: {e}")
+        return []
+
+    print(f"[INFO] {label}: {len(items)}건 수집 (Centralised - Authorisation 필터)")
     return items
 
 
@@ -356,7 +375,7 @@ def collect_approvals():
     all_items.extend(scrape_fda_cder())
     for src in MFDS_SOURCES:
         all_items.extend(scrape_mfds(src))
-    all_items.extend(scrape_eu())
+    all_items.extend(scrape_eu_playwright())
 
     for item in all_items:
         item["is_new"] = item["link"] not in seen
