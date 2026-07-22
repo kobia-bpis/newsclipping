@@ -53,12 +53,13 @@ from dateutil import parser as dateparser
 # -----------------------------
 
 KEYWORD_GROUPS = {
-    "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁개발생산"],
-    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant technology", "유전자재조합의약품"],
-    "세포유전자치료제": ["CAR-T", "CGT", "gene therapy", "viral vector", "cell therapy", "cancer vaccine", "oncolytic virus", "CRISPR-Cas9", "유전자치료제", "세포치료제"],
-    "항체/치료제 모달리티": ["monoclonal antibody", "antibody", "bispecific antibody", "Antibody drug conjugate"],
-    "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신"],
-    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval", "new ICH guide", "China drug approval", "식품의약품안전처 의약품", "식품의약품안전처 바이오의약품", "HHS policy", "clinical trial", "biologics guideline"],
+    "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁생산"],
+    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant DNA technology"],
+    "세포유전자치료제": ["CAR-T", "CGT", "cell and gene therapy", "AAV"],
+    "항체/치료제 모달리티": ["monoclonal antibody -mab", "Abs biologics", "GLP-1 agonist"],
+    "백신/톡신": ["vaccine biologics", "botulinum toxin"],
+    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval",
+                 "CDE China drug approval", "MFDS 식약처", "HHS biologics policy"],
 }
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
@@ -149,6 +150,7 @@ def build_url(keyword, lang_region):
     query = requests.utils.quote(f'"{keyword}" when:2d')
     return GOOGLE_NEWS_RSS.format(query=query, **lang_region)
 
+
 def strip_source_suffix(title, source):
     """Google News RSS 제목 끝에 자동으로 붙는 " - 언론사명"을 제거.
     출처(source)가 있으면 정확히 일치하는 접미사부터 우선 제거하고,
@@ -157,11 +159,12 @@ def strip_source_suffix(title, source):
         suffix = f" - {source}"
         if title.endswith(suffix):
             return title[: -len(suffix)].rstrip()
- 
+
     m = re.search(r"\s*[-–]\s*[^-–]{1,40}$", title)
     if m:
         return title[: m.start()].rstrip()
     return title
+
 
 def fetch_keyword_articles(keyword, lang_region):
     url = build_url(keyword, lang_region)
@@ -172,10 +175,10 @@ def fetch_keyword_articles(keyword, lang_region):
     except Exception as e:
         print(f"[WARN] RSS 요청 타임아웃/실패 ({keyword}, {lang_region['hl']}): {e}")
         return []
- 
+
     articles = []
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
- 
+
     for entry in feed.entries:
         try:
             published = dateparser.parse(entry.published)
@@ -183,10 +186,10 @@ def fetch_keyword_articles(keyword, lang_region):
                 published = published.replace(tzinfo=timezone.utc)
         except Exception:
             continue
- 
+
         if published < cutoff:
             continue
- 
+
         source = entry.get("source", {}).get("title", "") if hasattr(entry, "get") else ""
         clean_title = strip_source_suffix(entry.title, source)
         articles.append({
@@ -198,6 +201,7 @@ def fetch_keyword_articles(keyword, lang_region):
             "lang": lang_region["hl"],
         })
     return articles
+
 
 def normalize_title(title):
     t = re.sub(r"\s*-\s*[^-]+$", "", title)
@@ -414,7 +418,7 @@ def build_markdown(articles):
             pub_str = a["published"].strftime("%Y-%m-%d %H:%M UTC")
             src = f" - {a['source']}" if a["source"] else ""
             lang_tag = f" [{a['lang']}]"
-            lines.append(f"- **[{a['title']}]({a['link']})**{src} ({pub_str}){lang_tag} `[{a['keyword']}]`")
+            lines.append(f"- `[{a['keyword']}]` **[{a['title']}]({a['link']})**{src} ({pub_str}){lang_tag}")
             if a.get("title_ko"):
                 lines.append(f"  - 🇰🇷 번역: {a['title_ko']}")
             if a.get("summary"):
@@ -466,7 +470,8 @@ HTML_STYLE = """
   .item .summary { font-size:13px; color:#374151; margin-top:6px; background:#f3f4f6;
                     border-radius:6px; padding:8px 10px; }
   .tag { display:inline-block; background:#eef2ff; color:var(--accent); border-radius:5px;
-         padding:1px 6px; font-size:11px; margin-left:4px; }
+         padding:1px 6px; font-size:11px; font-weight:600; }
+  .tagrow { margin-bottom:4px; }
   .empty { color:var(--muted); font-size:13px; }
   footer { margin-top:32px; color:var(--muted); font-size:12px; text-align:center; }
   footer a { color:var(--accent); }
@@ -504,12 +509,14 @@ def build_html(articles):
                 country = LANG_NAMES.get(a["lang"], a["lang"])
                 sections.append('<div class="item">')
                 sections.append(
+                    f'<div class="tagrow"><span class="tag">{escape_html(a["keyword"])}</span></div>'
+                )
+                sections.append(
                     f'<a class="title" href="{escape_html(a["link"])}" target="_blank" rel="noopener">'
                     f'{escape_html(a["title"])}</a>'
                 )
                 sections.append(
-                    f'<div class="sub">{pub_str}{src} · {escape_html(country)} '
-                    f'<span class="tag">{escape_html(a["keyword"])}</span></div>'
+                    f'<div class="sub">{pub_str}{src} · {escape_html(country)}</div>'
                 )
                 if a.get("title_ko"):
                     sections.append(f'<div class="translated">🇰🇷 {escape_html(a["title_ko"])}</div>')
