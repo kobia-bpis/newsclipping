@@ -22,7 +22,13 @@ from bs4 import BeautifulSoup
 
 SEEN_STATE_PATH = "docs/seen_approvals.json"
 PMDA_STATE_PATH = "docs/pmda_attachments.json"
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApprovalMonitorBot/1.0; +https://github.com)"}
+# 일부 사이트(FDA 등)가 "Bot"이 들어간 User-Agent를 자동 차단하므로 일반 브라우저처럼 위장한다.
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+}
 REQUEST_TIMEOUT = 15
 
 
@@ -229,25 +235,26 @@ def check_pmda_updates():
 # 4. 한국 MFDS(식약처) - 베스트 에포트 (실행 결과 보고 조정 필요)
 # -----------------------------
 
-def build_mfds_url(induty_class_code, years_back=2):
-    """최근 N년(기본 2년) 허가 건만 검색하도록 startPermitDate 필터를 넣어 URL을 만든다.
-    사이트 기본 정렬이 날짜순이 아니라서, 날짜 범위로 먼저 좁혀놓고
-    scrape_mfds()에서 다시 한 번 허가일 내림차순으로 정렬한다."""
-    start_date = (datetime.now() - timedelta(days=365 * years_back)).strftime("%Y%m%d")
+def build_mfds_url(induty_class_code, page=1, years_back=2):
+    """최근 N년(기본 2년) 허가 건만 검색하도록 startPermitDate/endPermitDate 필터를 넣어 URL을 만든다.
+    두 값 모두 채워야 필터가 실제로 적용되고, 형식은 YYYY-MM-DD (대시 포함)여야 한다."""
+    today = datetime.now()
+    start_date = (today - timedelta(days=365 * years_back)).strftime("%Y-%m-%d")
+    end_date = today.strftime("%Y-%m-%d")
     return (
-        "https://nedrug.mfds.go.kr/searchDrug?sort=&sortOrder=false&searchYn=true&ExcelRowdata=&page=1"
+        f"https://nedrug.mfds.go.kr/searchDrug?sort=&sortOrder=false&searchYn=true&ExcelRowdata=&page={page}"
         "&searchDivision=detail&itemName=&itemEngName=&entpName=&entpEngName=&ingrName1=&ingrName2=&ingrName3="
         "&ingrEngName=&itemSeq=&stdrCodeName=&atcCodeName="
         f"&indutyClassCode={induty_class_code}"
         "&sClassNo=&narcoticKindCode=&cancelCode=&etcOtcCode=&makeMaterialGb=&searchConEe=AND&eeDocData="
         "&searchConUd=AND&udDocData=&searchConNb=AND&nbDocData="
-        f"&startPermitDate={start_date}&endPermitDate="
+        f"&startPermitDate={start_date}&endPermitDate={end_date}"
     )
 
 
 MFDS_SOURCES = [
-    {"label": "국내 생물의약품 허가", "url": build_mfds_url("C0")},
-    {"label": "국내 첨단바이오의약품 허가", "url": build_mfds_url("J0")},
+    {"label": "국내 생물의약품 허가", "induty_class_code": "C0"},
+    {"label": "국내 첨단바이오의약품 허가", "induty_class_code": "J0"},
 ]
 
 
@@ -260,24 +267,14 @@ def strip_label_prefix(text, label):
     return text
 
 
-def scrape_mfds(source, limit=10):
-    label = source["label"]
-    try:
-        resp = fetch(source["url"])
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        print(f"[WARN] {label} 요청 실패: {e}")
-        return []
-
+def parse_mfds_page(soup, label, page_url):
+    """MFDS 검색 결과 페이지 하나에서 (제품명, 허가일, 링크) 목록을 뽑아낸다."""
     tables = soup.find_all("table")
     if not tables:
-        print(f"[WARN] {label}: 테이블을 찾지 못함 (페이지 구조 확인 필요 - 베스트 에포트 단계)")
-        return []
+        return None  # 테이블 자체가 없음 (구조 문제 or 마지막 페이지)
 
     target = max(tables, key=lambda t: len(t.find_all("tr")))
 
-    # 헤더 행에서 "제품명"/"허가일" 컬럼 위치를 찾는다 (표 구조가 바뀌어도 비교적 안전)
     header_row = target.find("tr")
     header_cells = header_row.find_all(["th", "td"]) if header_row else []
     headers = [h.get_text(strip=True) for h in header_cells]
@@ -292,7 +289,6 @@ def scrape_mfds(source, limit=10):
     idx_date = find_idx("허가일")
 
     items = []
-    seen_titles = set()
     for row in target.find_all("tr")[1:]:
         cells = row.find_all("td")
         if not cells:
@@ -303,9 +299,8 @@ def scrape_mfds(source, limit=10):
         else:
             title = strip_label_prefix(cells[0].get_text(strip=True), "제품명") if cells else ""
 
-        if not title or title in seen_titles:
-            continue  # 동일 제품명 중복 행 제거
-        seen_titles.add(title)
+        if not title:
+            continue
 
         date_text = ""
         if idx_date is not None and idx_date < len(cells):
@@ -318,17 +313,55 @@ def scrape_mfds(source, limit=10):
         elif href:
             full_link = "https://nedrug.mfds.go.kr" + (href if href.startswith("/") else "/" + href)
         else:
-            full_link = source["url"]
+            full_link = page_url
 
         items.append({"title": title, "link": full_link, "source": label, "date": date_text})
-        # 여기서는 limit으로 끊지 않는다 - 사이트 기본 정렬이 날짜순이 아니라서
-        # 전체를 모은 뒤 아래에서 허가일 기준으로 다시 정렬해야 진짜 "최신"이 나온다.
+
+    return items
+
+
+def scrape_mfds(source, limit=10, max_pages=5):
+    """사이트 기본 정렬이 날짜순이 아니고, 날짜 필터(startPermitDate)가 실제로 먹는지도
+    불확실하므로, 여러 페이지(기본 5페이지)를 모아 후보군을 늘린 뒤 허가일 기준으로
+    다시 정렬해서 최신 것만 추린다."""
+    label = source["label"]
+    induty_class_code = source["induty_class_code"]
+
+    all_items = []
+    seen_titles = set()
+    for page in range(1, max_pages + 1):
+        url = build_mfds_url(induty_class_code, page=page)
+        try:
+            resp = fetch(url)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            print(f"[WARN] {label} (page {page}) 요청 실패: {e}")
+            break
+
+        page_items = parse_mfds_page(soup, label, url)
+        if page_items is None:
+            print(f"[WARN] {label} (page {page}): 테이블을 찾지 못함 (페이지 구조 확인 필요)")
+            break
+        if not page_items:
+            break  # 더 이상 결과 없음 (마지막 페이지 도달)
+
+        new_count = 0
+        for item in page_items:
+            if item["title"] in seen_titles:
+                continue
+            seen_titles.add(item["title"])
+            all_items.append(item)
+            new_count += 1
+
+        if new_count == 0:
+            break  # 페이지를 넘겨도 새 항목이 없으면 그만 (페이지네이션 미지원 등)
 
     # 허가일 내림차순 정렬 (날짜 파싱 실패/공란은 맨 뒤로) 후 최신 limit건만 사용
-    items.sort(key=lambda x: x["date"] or "0000-00-00", reverse=True)
-    items = items[:limit]
+    all_items.sort(key=lambda x: x["date"] or "0000-00-00", reverse=True)
+    items = all_items[:limit]
 
-    print(f"[INFO] {label}: {len(items)}건 수집, 최신 허가일 기준 정렬 (헤더: {headers[:9]})")
+    print(f"[INFO] {label}: 총 {len(all_items)}건 후보 중 최신 {len(items)}건 선택 (허가일 기준 정렬)")
     return items
 
 
