@@ -19,11 +19,39 @@ import os
 import re
 import json
 import requests
+from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
 SEEN_STATE_PATH = "docs/seen_reports.json"
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ReportMonitorBot/1.0; +https://github.com)"}
 REQUEST_TIMEOUT = 12
+
+# 보고서 발간일/업로드일 추출용 날짜 패턴 (링크 주변 텍스트에서 찾는다 - 사이트마다 형식이 달라 베스트 에포트)
+DATE_PATTERNS = [
+    r"\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}",              # 2026.07.15 / 2026-07-15 / 2026/07/15
+    r"[A-Za-z]{3,9}\s+\d{1,2},?\s*-?\s*\d{4}",        # Jul 10, 2026 / Jul 10 - 2026
+    r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",               # 10 July 2026
+]
+
+
+def find_nearby_date(tag, max_levels=4):
+    """링크 태그 주변(부모 요소들)의 텍스트에서 날짜로 보이는 문자열을 찾아 YYYY-MM-DD로 반환.
+    사이트마다 날짜 위치·형식이 달라 100% 정확하지는 않은 베스트 에포트 방식."""
+    node = tag
+    for _ in range(max_levels):
+        if node is None:
+            break
+        text = node.get_text(" ", strip=True) if hasattr(node, "get_text") else ""
+        for pat in DATE_PATTERNS:
+            m = re.search(pat, text)
+            if m:
+                try:
+                    dt = dateparser.parse(m.group(0), fuzzy=True)
+                    return dt.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+        node = node.parent
+    return None
 
 # -----------------------------
 # 1. 실제로 긁어오는 소스 (href URL 패턴 매칭 방식)
@@ -141,7 +169,8 @@ def scrape_by_href_pattern(source):
         if keyword_filter and not any(kw in title for kw in keyword_filter):
             continue
         seen_links.add(full_link)
-        items.append({"title": title, "link": full_link, "source": label})
+        date_str = find_nearby_date(a)
+        items.append({"title": title, "link": full_link, "source": label, "date": date_str})
         if len(items) >= limit:
             break
 
@@ -205,9 +234,10 @@ def build_report_panel_html(items):
             parts.append(f'<h3>{escape_html(src)}</h3>')
             for item in grouped[src]:
                 new_badge = ' <span class="new-badge">NEW</span>' if item.get("is_new") else ""
+                date_str = f' <span class="date-tag">{escape_html(item["date"])}</span>' if item.get("date") else ""
                 parts.append(
                     f'<div class="src-item"><a href="{escape_html(item["link"])}" target="_blank" '
-                    f'rel="noopener">{escape_html(item["title"])}</a>{new_badge}</div>'
+                    f'rel="noopener">{escape_html(item["title"])}</a>{date_str}{new_badge}</div>'
                 )
             parts.append("</div>")
 
