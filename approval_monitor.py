@@ -17,12 +17,24 @@ import re
 import json
 import requests
 from datetime import datetime
+from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
 SEEN_STATE_PATH = "docs/seen_approvals.json"
 PMDA_STATE_PATH = "docs/pmda_attachments.json"
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ApprovalMonitorBot/1.0; +https://github.com)"}
 REQUEST_TIMEOUT = 15
+
+
+def normalize_date(date_text):
+    """다양한 형식의 날짜 문자열을 YYYY-MM-DD로 통일. 파싱 실패 시 원본 텍스트 그대로 반환."""
+    if not date_text:
+        return ""
+    try:
+        dt = dateparser.parse(date_text, fuzzy=True)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return date_text
 
 
 def fetch(url, timeout=REQUEST_TIMEOUT):
@@ -74,7 +86,7 @@ def scrape_fda_cber(limit=10):
             continue  # 허가 레터만 (SOPP·가이던스 문서 등은 제외)
         href = link_tag.get("href", "")
         full_link = href if href.startswith("http") else "https://www.fda.gov" + href
-        items.append({"date": date_text, "title": title, "link": full_link, "source": label})
+        items.append({"date": normalize_date(date_text), "title": title, "link": full_link, "source": label})
 
     print(f"[INFO] {label}: {len(items)}건 수집")
     return items[:limit]
@@ -124,7 +136,7 @@ def scrape_fda_cder(limit=15):
         full_link = href if href.startswith("http") else "https://www.accessdata.fda.gov" + href
         tag = "BLA(생물의약품)" if is_bla else "신물질(NME)"
         items.append({
-            "date": date_text, "title": f"{drug_name} [{tag}]",
+            "date": normalize_date(date_text), "title": f"{drug_name} [{tag}]",
             "link": full_link, "source": label,
         })
 
@@ -229,6 +241,15 @@ MFDS_SOURCES = [
 ]
 
 
+def strip_label_prefix(text, label):
+    """모바일 반응형 테이블에서 셀 안에 숨겨진 컬럼명 라벨이 값 앞에 같이 붙어 나오는 경우
+    (예: '제품명BMS수출용...') 그 라벨 접두어만 제거한다."""
+    text = (text or "").strip()
+    if label and text.startswith(label):
+        return text[len(label):].strip()
+    return text
+
+
 def scrape_mfds(source, limit=10):
     label = source["label"]
     try:
@@ -245,15 +266,42 @@ def scrape_mfds(source, limit=10):
         return []
 
     target = max(tables, key=lambda t: len(t.find_all("tr")))
+
+    # 헤더 행에서 "제품명"/"허가일" 컬럼 위치를 찾는다 (표 구조가 바뀌어도 비교적 안전)
+    header_row = target.find("tr")
+    header_cells = header_row.find_all(["th", "td"]) if header_row else []
+    headers = [h.get_text(strip=True) for h in header_cells]
+
+    def find_idx(keyword):
+        for i, h in enumerate(headers):
+            if keyword in h:
+                return i
+        return None
+
+    idx_name = find_idx("제품명")
+    idx_date = find_idx("허가일")
+
     items = []
+    seen_titles = set()
     for row in target.find_all("tr")[1:]:
         cells = row.find_all("td")
-        if len(cells) < 2:
+        if not cells:
             continue
+
+        if idx_name is not None and idx_name < len(cells):
+            title = strip_label_prefix(cells[idx_name].get_text(strip=True), "제품명")
+        else:
+            title = strip_label_prefix(cells[0].get_text(strip=True), "제품명") if cells else ""
+
+        if not title or title in seen_titles:
+            continue  # 동일 제품명 중복 행 제거
+        seen_titles.add(title)
+
+        date_text = ""
+        if idx_date is not None and idx_date < len(cells):
+            date_text = normalize_date(strip_label_prefix(cells[idx_date].get_text(strip=True), "허가일"))
+
         link_tag = row.find("a", href=True)
-        title = cells[1].get_text(strip=True) if len(cells) > 1 else row.get_text(strip=True)[:80]
-        if not title:
-            continue
         href = link_tag["href"] if link_tag else None
         if href and href.startswith("http"):
             full_link = href
@@ -261,11 +309,12 @@ def scrape_mfds(source, limit=10):
             full_link = "https://nedrug.mfds.go.kr" + (href if href.startswith("/") else "/" + href)
         else:
             full_link = source["url"]
-        items.append({"title": title, "link": full_link, "source": label})
+
+        items.append({"title": title, "link": full_link, "source": label, "date": date_text})
         if len(items) >= limit:
             break
 
-    print(f"[INFO] {label}: {len(items)}건 수집 (베스트 에포트)")
+    print(f"[INFO] {label}: {len(items)}건 수집 (베스트 에포트, 헤더: {headers[:9]})")
     return items
 
 
@@ -334,7 +383,7 @@ def scrape_eu_playwright(limit=20):
                 full_link = href if (href and href.startswith("http")) else EU_SOURCE["url"]
                 date_text = cells[idx_date].inner_text().strip() if idx_date is not None and idx_date < len(cells) else ""
 
-                items.append({"date": date_text, "title": title, "link": full_link, "source": label})
+                items.append({"date": normalize_date(date_text), "title": title, "link": full_link, "source": label})
                 if len(items) >= limit:
                     break
 
