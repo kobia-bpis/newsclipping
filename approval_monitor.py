@@ -15,6 +15,7 @@
 import os
 import re
 import json
+import time
 import requests
 from datetime import datetime, timedelta
 from dateutil import parser as dateparser
@@ -28,6 +29,10 @@ REQUEST_HEADERS = {
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,ko;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.google.com/",
 }
 REQUEST_TIMEOUT = 15
 
@@ -43,8 +48,22 @@ def normalize_date(date_text):
         return date_text
 
 
-def fetch(url, timeout=REQUEST_TIMEOUT):
-    return requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+def fetch(url, timeout=REQUEST_TIMEOUT, retries=3, backoff=2):
+    """연결이 자주 끊기거나(MFDS 등) 일시적으로 차단되는 사이트(FDA 등)를 위해
+    재시도 로직을 넣은 요청 함수. HTTP 오류 상태코드도 재시도 대상에 포함한다."""
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < retries:
+                wait = backoff * attempt
+                print(f"[WARN] 요청 실패 ({attempt}/{retries}), {wait}초 후 재시도: {e}")
+                time.sleep(wait)
+    raise last_exc
 
 
 def load_json(path):
@@ -120,33 +139,34 @@ def scrape_fda_cder(limit=15):
     # 행이 가장 많은 테이블 = 승인 목록 테이블
     target = max(tables, key=lambda t: len(t.find_all("tr")))
 
+    # 테이블 컬럼 순서: Approval Date | Drug Name | Submission | Active Ingredients |
+    #                   Company | Submission Classification | Submission Status
     items = []
     for row in target.find_all("tr"):
         cells = row.find_all("td")
-        if len(cells) < 6:
+        if len(cells) < 3:
             continue
         link_tag = cells[1].find("a") if len(cells) > 1 else None
         if not link_tag:
             continue
         drug_name = link_tag.get_text(strip=True)
         date_text = cells[0].get_text(strip=True)
-        classification = cells[5].get_text(strip=True) if len(cells) > 5 else ""
+        submission_type = cells[2].get_text(strip=True)  # 예: "ORIG-1", "SUPPL-23"
 
-        # 노이즈 제거: 생물의약품(BLA) 또는 진짜 신약(New Molecular Entity)만
+        # BLA(생물의약품)이면서, 신규 신청(Original)인 건만 — 라벨 변경 등 보충신청(SUPPL-*)은 제외
         is_bla = "BLA" in drug_name
-        is_nme = "New Molecular Entity" in classification
-        if not (is_bla or is_nme):
+        is_original = submission_type.upper().startswith("ORIG")
+        if not (is_bla and is_original):
             continue
 
         href = link_tag.get("href", "")
         full_link = href if href.startswith("http") else "https://www.accessdata.fda.gov" + href
-        tag = "BLA(생물의약품)" if is_bla else "신물질(NME)"
         items.append({
-            "date": normalize_date(date_text), "title": f"{drug_name} [{tag}]",
+            "date": normalize_date(date_text), "title": f"{drug_name} [{submission_type}]",
             "link": full_link, "source": label,
         })
 
-    print(f"[INFO] {label}: {len(items)}건 수집 (BLA/신물질 필터 적용)")
+    print(f"[INFO] {label}: {len(items)}건 수집 (BLA + Original 신청건만 필터)")
     return items[:limit]
 
 
@@ -356,6 +376,8 @@ def scrape_mfds(source, limit=10, max_pages=5):
 
         if new_count == 0:
             break  # 페이지를 넘겨도 새 항목이 없으면 그만 (페이지네이션 미지원 등)
+
+        time.sleep(1.5)  # 페이지 연속 요청으로 서버가 연결을 끊는 것을 방지
 
     # 허가일 내림차순 정렬 (날짜 파싱 실패/공란은 맨 뒤로) 후 최신 limit건만 사용
     all_items.sort(key=lambda x: x["date"] or "0000-00-00", reverse=True)
