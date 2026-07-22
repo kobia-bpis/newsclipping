@@ -287,6 +287,11 @@ def strip_label_prefix(text, label):
     return text
 
 
+NO_DATA_MARKERS = [
+    "there is no data", "no data", "조회된 데이터가 없습니다", "검색결과가 없습니다", "데이터가 없습니다",
+]
+
+
 def parse_mfds_page(soup, label, page_url):
     """MFDS 검색 결과 페이지 하나에서 (제품명, 허가일, 링크) 목록을 뽑아낸다."""
     tables = soup.find_all("table")
@@ -313,6 +318,10 @@ def parse_mfds_page(soup, label, page_url):
         cells = row.find_all("td")
         if not cells:
             continue
+
+        row_text_lower = row.get_text(strip=True).lower()
+        if any(marker in row_text_lower for marker in NO_DATA_MARKERS):
+            continue  # "There is no data" 같은 결과없음 안내 행은 제품이 아니므로 건너뜀
 
         if idx_name is not None and idx_name < len(cells):
             title = strip_label_prefix(cells[idx_name].get_text(strip=True), "제품명")
