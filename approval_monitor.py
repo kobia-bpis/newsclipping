@@ -16,6 +16,7 @@ import os
 import re
 import json
 import requests
+from datetime import datetime
 from bs4 import BeautifulSoup
 
 SEEN_STATE_PATH = "docs/seen_approvals.json"
@@ -141,12 +142,29 @@ PMDA_PAGES = [
 ]
 
 
+def get_last_modified_date(url):
+    """파일 URL의 HTTP Last-Modified 헤더로 실제 파일 갱신 날짜를 가져온다.
+    헤더가 없으면 None 반환 (호출부에서 감지 날짜로 대체)."""
+    try:
+        resp = requests.head(url, headers=REQUEST_HEADERS, timeout=8, allow_redirects=True)
+        lm = resp.headers.get("Last-Modified")
+        if lm:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(lm)
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return None
+
+
 def check_pmda_updates():
     """PMDA는 개별 승인 품목이 HTML이 아닌 PDF/Excel 첨부파일로만 제공된다.
-    첨부파일 URL이 이전 실행과 다르면(=파일이 갱신됐다는 뜻) NEW로 표시."""
+    첨부파일 URL이 이전 실행과 다르면(=파일이 갱신됐다는 뜻) NEW로 표시하고,
+    가능하면 파일의 실제 갱신 날짜(Last-Modified 헤더)도 함께 보여준다."""
     prev_state = load_json(PMDA_STATE_PATH) or {}
     new_state = {}
     results = []
+    today_str = datetime.now().strftime("%Y-%m-%d")
 
     for page in PMDA_PAGES:
         label = page["label"]
@@ -158,22 +176,38 @@ def check_pmda_updates():
             print(f"[WARN] {label} 요청 실패: {e}")
             continue
 
-        attachments = sorted({
+        attachment_hrefs = sorted({
             a["href"] for a in soup.find_all("a", href=True)
             if a["href"].lower().endswith((".pdf", ".xlsx", ".xls"))
         })
-        new_state[label] = attachments
+        attachments_full = [
+            href if href.startswith("http") else requests.compat.urljoin(page["url"], href)
+            for href in attachment_hrefs
+        ]
+
+        new_state[label] = attachment_hrefs
         prev_attachments = set(prev_state.get(label, []))
-        is_updated = bool(attachments) and set(attachments) != prev_attachments
+        is_updated = bool(attachment_hrefs) and set(attachment_hrefs) != prev_attachments
+
+        date_str = None
+        if attachments_full:
+            date_str = get_last_modified_date(attachments_full[0])
+        if not date_str and is_updated:
+            date_str = today_str  # 헤더로 못 가져오면 감지된(오늘) 날짜로 대체
+
+        note = "최근 갱신 없음"
+        if is_updated:
+            note = f"첨부파일이 갱신되었습니다 ({date_str}) - 클릭해서 확인하세요" if date_str else "첨부파일이 갱신되었습니다 - 클릭해서 확인하세요"
 
         results.append({
             "title": label,
             "link": page["url"],
             "source": "PMDA (일본)",
             "is_new": is_updated,
-            "note": "첨부파일이 갱신되었습니다 - 클릭해서 확인하세요" if is_updated else "최근 갱신 없음",
+            "date": date_str,
+            "note": note,
         })
-        print(f"[INFO] {label}: 첨부 {len(attachments)}개, 갱신여부={is_updated}")
+        print(f"[INFO] {label}: 첨부 {len(attachment_hrefs)}개, 갱신여부={is_updated}, 날짜={date_str}")
 
     save_json(PMDA_STATE_PATH, new_state)
     return results
@@ -236,12 +270,19 @@ def scrape_mfds(source, limit=10):
 
 
 # -----------------------------
-# 5. EU 의약품 등록부 - 베스트 에포트 (실행 결과 보고 조정 필요)
+# 5. EU 의약품 허가 - EMA "What's New" (안정적)
 # -----------------------------
+# 참고: 사용자가 처음 제시한 ec.europa.eu/health/documents/community-register 는
+# EU가 사이트를 commission.europa.eu로 통합 이전하면서 껍데기만 남고 실제 목록이
+# 사라진 상태(브라우저에서 열면 commission.europa.eu/index_en로 넘어감).
+# 대신 EMA(유럽의약품청)의 "What's New" 피드가 실제로 작동하는 정적 테이블이라
+# 이쪽으로 교체했다. Type이 "Medicine"인 항목만 필터링한다.
+# 주의: 이 피드는 신규 허가와 기존 의약품의 라벨 변경 등 갱신을 구분하지 않고
+# 모두 "Medicine" 항목으로 묶어서 보여준다 — 100% 신규 허가만은 아님.
 
 EU_SOURCE = {
-    "label": "EU 의약품 허가(Community Register)",
-    "url": "https://ec.europa.eu/health/documents/community-register/html/reg_last.htm",
+    "label": "EU 의약품 정보 갱신 (EMA)",
+    "url": "https://www.ema.europa.eu/en/news-events/whats-new",
 }
 
 
@@ -255,37 +296,35 @@ def scrape_eu(limit=15):
         print(f"[WARN] {label} 요청 실패: {e}")
         return []
 
-    # 구식 프레임 기반 사이트일 가능성 -> frame/iframe 있으면 따라가서 재요청
-    frame = soup.find("frame") or soup.find("iframe")
-    if frame and frame.get("src"):
-        frame_url = frame["src"]
-        if not frame_url.startswith("http"):
-            frame_url = requests.compat.urljoin(EU_SOURCE["url"], frame_url)
-        try:
-            resp = fetch(frame_url)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-        except Exception as e:
-            print(f"[WARN] {label} 프레임 요청 실패: {e}")
-            return []
+    tables = soup.find_all("table")
+    if not tables:
+        print(f"[WARN] {label}: 테이블을 찾지 못함 (페이지 구조 확인 필요)")
+        return []
+    target = max(tables, key=lambda t: len(t.find_all("tr")))
 
     items = []
-    for a in soup.find_all("a", href=True):
-        title = a.get_text(strip=True)
-        href = a["href"]
-        if not title or len(title) < 8:
+    for row in target.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 2:
             continue
-        if not re.search(r"\.htm[l]?$", href, re.IGNORECASE):
+        date_text = cells[0].get_text(strip=True)
+        content_cell = cells[1]
+        type_tag = content_cell.find("strong") or content_cell.find("b")
+        content_type = type_tag.get_text(strip=True).rstrip(":") if type_tag else ""
+        if content_type != "Medicine":
+            continue  # 의약품 항목만 (문서·이벤트·PIP·Orphan 등은 제외)
+
+        link_tag = content_cell.find("a")
+        if not link_tag:
             continue
-        full_link = href if href.startswith("http") else requests.compat.urljoin(EU_SOURCE["url"], href)
-        items.append({"title": title, "link": full_link, "source": label})
+        title = link_tag.get_text(strip=True)
+        href = link_tag.get("href", "")
+        full_link = href if href.startswith("http") else "https://www.ema.europa.eu" + href
+        items.append({"date": date_text, "title": title, "link": full_link, "source": label})
         if len(items) >= limit:
             break
 
-    if not items:
-        print(f"[WARN] {label}: 항목을 찾지 못함 (페이지 구조 확인 필요 - 베스트 에포트 단계)")
-    else:
-        print(f"[INFO] {label}: {len(items)}건 수집 (베스트 에포트)")
+    print(f"[INFO] {label}: {len(items)}건 수집 (Medicine 항목만 필터)")
     return items
 
 
