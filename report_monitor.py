@@ -72,8 +72,11 @@ SCRAPE_SOURCES = [
     },
     {
         "label": "IQVIA Institute",
-        "url": "https://www.iqvia.com/insights/the-iqvia-institute",
+        "url": "https://www.iqvia.com/insights/the-iqvia-institute/reports-and-publications/reports",
         "pattern": r"/insights/the-iqvia-institute/reports-and-publications/reports/[a-z0-9]",
+        "exclude_exact": [
+            "https://www.iqvia.com/insights/the-iqvia-institute/reports-and-publications/reports/reports-archive",
+        ],
         "limit": 8,
     },
     {
