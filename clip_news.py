@@ -98,7 +98,7 @@ def is_priority_source(source_name):
 GROUP_BY = os.environ.get("GROUP_BY", "recent")
 
 # 유사 중복 기사 제거 기준 (0~1, 높을수록 엄격). 기본 0.82
-DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.82"))
+DEDUP_SIMILARITY_THRESHOLD = float(os.environ.get("DEDUP_SIMILARITY_THRESHOLD", "0.78"))
 
 LOOKBACK_HOURS = 30
 OUTPUT_DIR = "digests"
