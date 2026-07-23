@@ -56,6 +56,10 @@ DASHBOARD_STYLE = """
   .tag { display:inline-block; background:#eef2ff; color:var(--accent); border-radius:5px;
          padding:1px 6px; font-size:11px; font-weight:600; }
   .tagrow { margin-bottom:4px; }
+  .priority-item { background:#fffbeb; margin:0 -10px; padding:10px 10px; border-radius:8px; border-top:none; }
+  .priority-item:first-child { padding-top:10px; }
+  .priority-badge { display:inline-block; background:#fef3c7; color:#92400e; border-radius:5px;
+                     padding:1px 6px; font-size:11px; font-weight:700; margin-left:4px; }
   .empty { color:var(--muted); font-size:13px; }
   .panel-header { display:flex; justify-content:space-between; align-items:baseline; margin:0 0 14px; }
   .panel-header h2 { font-size:18px; margin:0; }
