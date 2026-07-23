@@ -53,13 +53,13 @@ from dateutil import parser as dateparser
 # -----------------------------
 
 KEYWORD_GROUPS = {
-    "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁개발생산"],
-    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant technology", "유전자재조합의약품", "바이오의약품", "한국바이오의약품협회"],
-    "세포유전자치료제": ["CAR-T", "CGT", "gene therapy", "viral vector", "cell therapy", "cancer vaccine", "oncolytic virus", "CRISPR-Cas9", "유전자치료제", "세포치료제"],
-    "항체/치료제 모달리티": ["monoclonal antibody", "antibody", "bispecific antibody", "Antibody drug conjugate"],
-    "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신"],
-    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval"
-                 "CDE China drug approval", "식품의약품안전처", "HHS biologics policy", "clinical trial", "biologics guideline"],
+    "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁생산"],
+    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant DNA technology"],
+    "세포유전자치료제": ["CAR-T", "CGT", "cell and gene therapy", "AAV"],
+    "항체/치료제 모달리티": ["monoclonal antibody -mab", "Abs biologics", "GLP-1 agonist"],
+    "백신/톡신": ["vaccine biologics", "botulinum toxin"],
+    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval",
+                 "CDE China drug approval", "MFDS 식약처", "HHS biologics policy"],
 }
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
@@ -76,6 +76,23 @@ LANG_NAMES = {
     "en-US": "미국", "ko": "한국", "ja": "일본",
     "zh-CN": "중국", "en-GB": "영국", "de": "독일",
 }
+
+# 규제·정책/산업 분석에 신뢰도가 높은 전문 매체 목록 - 이 매체 기사는 정렬 시 항상 위쪽에 오고
+# 별도 뱃지(⭐)로 표시된다. 기사의 출처(source) 문자열에 아래 키워드가 포함되면 매칭.
+PRIORITY_SOURCES = [
+    "Pink Sheet", "BioCentury", "Endpoints News", "RAPS", "Regulatory Focus",
+    "Fierce Biotech", "FierceBiotech", "Fierce Pharma", "FiercePharma",
+    "STAT", "BioPharma Dive", "BioWorld",
+]
+
+
+def is_priority_source(source_name):
+    """기사 출처가 신뢰도 높은 전문 매체 목록에 포함되는지 확인 (대소문자 무시, 부분 일치)."""
+    if not source_name:
+        return False
+    lower = source_name.lower()
+    return any(p.lower() in lower for p in PRIORITY_SOURCES)
+
 
 # 다이제스트 표시 방식: "recent"(최신순 전체 나열, 기본) | "country"(국가별 그룹) | "keyword"(기존 키워드별 그룹)
 GROUP_BY = os.environ.get("GROUP_BY", "recent")
@@ -377,13 +394,19 @@ def organize_articles(articles):
     """GROUP_BY 설정에 따라 (섹션 제목 또는 None, 기사 리스트) 튜플 리스트를 반환.
     - "recent": 그룹 없이 전체를 최신순으로 나열 (섹션 제목 None)
     - "country": 국가/지역별로 묶어서, 각 그룹 내부는 최신순
-    - "keyword": 기존 방식(키워드 그룹별)"""
+    - "keyword": 기존 방식(키워드 그룹별)
+    각 그룹 내부는 "우선 매체(PRIORITY_SOURCES) 여부"를 최우선 기준으로,
+    그 다음 최신순으로 정렬한다 — 우선 매체 기사가 항상 위쪽에 온다."""
+
+    def sort_key(a):
+        return (0 if is_priority_source(a.get("source")) else 1, -a["published"].timestamp())
+
     if GROUP_BY == "keyword":
         grouped = {}
         for a in articles:
             grouped.setdefault(a["group"], []).append(a)
         return [
-            (g, sorted(grouped.get(g, []), key=lambda x: x["published"], reverse=True))
+            (g, sorted(grouped.get(g, []), key=sort_key))
             for g in KEYWORD_GROUPS
         ]
 
@@ -396,12 +419,12 @@ def organize_articles(articles):
             if name not in order:
                 order.append(name)
         return [
-            (name, sorted(grouped[name], key=lambda x: x["published"], reverse=True))
+            (name, sorted(grouped[name], key=sort_key))
             for name in order
         ]
 
-    # 기본값: "recent" — 그룹 없이 최신순 전체 나열
-    return [(None, sorted(articles, key=lambda x: x["published"], reverse=True))]
+    # 기본값: "recent" — 그룹 없이 우선매체 우선 + 최신순 전체 나열
+    return [(None, sorted(articles, key=sort_key))]
 
 
 def build_markdown(articles):
@@ -418,7 +441,8 @@ def build_markdown(articles):
             pub_str = a["published"].strftime("%Y-%m-%d %H:%M UTC")
             src = f" - {a['source']}" if a["source"] else ""
             lang_tag = f" [{a['lang']}]"
-            lines.append(f"- `[{a['keyword']}]` **[{a['title']}]({a['link']})**{src} ({pub_str}){lang_tag}")
+            star = " ⭐" if is_priority_source(a.get("source")) else ""
+            lines.append(f"- `[{a['keyword']}]` **[{a['title']}]({a['link']})**{star}{src} ({pub_str}){lang_tag}")
             if a.get("title_ko"):
                 lines.append(f"  - 🇰🇷 번역: {a['title_ko']}")
             if a.get("summary"):
@@ -472,6 +496,10 @@ HTML_STYLE = """
   .tag { display:inline-block; background:#eef2ff; color:var(--accent); border-radius:5px;
          padding:1px 6px; font-size:11px; font-weight:600; }
   .tagrow { margin-bottom:4px; }
+  .priority-item { background:#fffbeb; margin:0 -10px; padding:10px 10px; border-radius:8px; border-top:none; }
+  .priority-item:first-child { padding-top:10px; }
+  .priority-badge { display:inline-block; background:#fef3c7; color:#92400e; border-radius:5px;
+                     padding:1px 6px; font-size:11px; font-weight:700; margin-left:4px; }
   .empty { color:var(--muted); font-size:13px; }
   .panel-header { display:flex; justify-content:space-between; align-items:baseline; margin:0 0 14px; }
   .panel-header h2 { font-size:18px; margin:0; }
@@ -512,9 +540,12 @@ def build_news_panel_html(articles):
                 pub_str = a["published"].strftime("%Y-%m-%d %H:%M UTC")
                 src = f" · {escape_html(a['source'])}" if a["source"] else ""
                 country = LANG_NAMES.get(a["lang"], a["lang"])
-                sections.append('<div class="item">')
+                priority = is_priority_source(a.get("source"))
+                item_class = "item priority-item" if priority else "item"
+                star_badge = ' <span class="priority-badge">⭐ 우선매체</span>' if priority else ""
+                sections.append(f'<div class="{item_class}">')
                 sections.append(
-                    f'<div class="tagrow"><span class="tag">{escape_html(a["keyword"])}</span></div>'
+                    f'<div class="tagrow"><span class="tag">{escape_html(a["keyword"])}</span>{star_badge}</div>'
                 )
                 sections.append(
                     f'<a class="title" href="{escape_html(a["link"])}" target="_blank" rel="noopener">'
