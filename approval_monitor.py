@@ -521,7 +521,7 @@ def collect_approvals():
     all_items.extend(scrape_fda_cber())
     all_items.extend(scrape_fda_cder())
     for src in MFDS_SOURCES:
-        all_items.extend(scrape_mfds(src))
+        all_items.extend(scrape_mfds(src, days_back=MFDS_RECENT_DAYS))
     all_items.extend(scrape_eu_playwright())
 
     for item in all_items:
@@ -554,8 +554,8 @@ APPROVAL_SOURCE_META = [
     {"key": "FDA CBER (생물학적제제)", "home_url": "https://www.fda.gov/vaccines-blood-biologics/news-events-biologics/whats-new-biologics"},
     {"key": "FDA CDER", "home_url": "https://www.accessdata.fda.gov/scripts/cder/daf/index.cfm?event=reportsSearch.process"},
     {"key": "EU 신규 허가 (Community Register)", "home_url": EU_SOURCE["url"]},
-    {"key": "국내 생물의약품 허가", "home_url": build_mfds_url("C0", page=1)},
-    {"key": "국내 첨단바이오의약품 허가", "home_url": build_mfds_url("J0", page=1)},
+    {"key": "국내 생물의약품 허가", "home_url": build_mfds_url("C0", page=1, days_back=MFDS_RECENT_DAYS)},
+    {"key": "국내 첨단바이오의약품 허가", "home_url": build_mfds_url("J0", page=1, days_back=MFDS_RECENT_DAYS)},
     {"key": "PMDA (일본)", "home_url": "https://www.pmda.go.jp/0017.html"},
 ]
 
@@ -597,7 +597,10 @@ def build_approval_panel_html(items, pmda_results):
                         f'rel="noopener">{escape_html(item["title"])}</a>{date_str}{new_badge}</div>'
                     )
             else:
-                parts.append('<p class="empty">최근 수집된 항목이 없습니다.</p>')
+                if key in {"국내 생물의약품 허가", "국내 첨단바이오의약품 허가"}:
+                    parts.append(f'<p class="empty">최근 {MFDS_RECENT_DAYS}일 내 허가 항목이 없습니다.</p>')
+                else:
+                    parts.append('<p class="empty">최근 수집된 항목이 없습니다.</p>')
 
         parts.append("</div>")
 
