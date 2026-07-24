@@ -255,11 +255,14 @@ def check_pmda_updates():
 # 4. 한국 MFDS(식약처) - 베스트 에포트 (실행 결과 보고 조정 필요)
 # -----------------------------
 
-def build_mfds_url(induty_class_code, page=1, years_back=2):
-    """최근 N년(기본 2년) 허가 건만 검색하도록 startPermitDate/endPermitDate 필터를 넣어 URL을 만든다.
-    두 값 모두 채워야 필터가 실제로 적용되고, 형식은 YYYY-MM-DD (대시 포함)여야 한다."""
+MFDS_RECENT_DAYS = 30
+
+
+def build_mfds_url(induty_class_code, page=1, days_back=MFDS_RECENT_DAYS):
+    """최근 N일(기본 30일) 허가 건만 검색하도록 허가일 조건을 넣어 URL을 만든다.
+    두 날짜를 모두 입력하고, 사이트 검색 결과와 무관하게 수집 후에도 동일 기간으로 재필터링한다."""
     today = datetime.now()
-    start_date = (today - timedelta(days=365 * years_back)).strftime("%Y-%m-%d")
+    start_date = (today - timedelta(days=days_back)).strftime("%Y-%m-%d")
     end_date = today.strftime("%Y-%m-%d")
     return (
         f"https://nedrug.mfds.go.kr/searchDrug?sort=&sortOrder=false&searchYn=true&ExcelRowdata=&page={page}"
@@ -349,17 +352,19 @@ def parse_mfds_page(soup, label, page_url):
     return items
 
 
-def scrape_mfds(source, limit=10, max_pages=5):
-    """사이트 기본 정렬이 날짜순이 아니고, 날짜 필터(startPermitDate)가 실제로 먹는지도
-    불확실하므로, 여러 페이지(기본 5페이지)를 모아 후보군을 늘린 뒤 허가일 기준으로
-    다시 정렬해서 최신 것만 추린다."""
+def scrape_mfds(source, days_back=MFDS_RECENT_DAYS, max_pages=20):
+    """식약처 허가 결과 중 최근 N일 이내 항목을 모두 수집한다.
+
+    사이트의 허가일 검색조건이 적용되지 않거나 정렬이 달라지는 경우에 대비해 여러 페이지를
+    수집한 뒤, 파싱한 허가일을 기준으로 최근 N일 범위를 다시 한 번 엄격하게 필터링한다.
+    """
     label = source["label"]
     induty_class_code = source["induty_class_code"]
 
     all_items = []
-    seen_titles = set()
+    seen_items = set()
     for page in range(1, max_pages + 1):
-        url = build_mfds_url(induty_class_code, page=page)
+        url = build_mfds_url(induty_class_code, page=page, days_back=days_back)
         try:
             resp = fetch(url)
             resp.raise_for_status()
@@ -377,9 +382,10 @@ def scrape_mfds(source, limit=10, max_pages=5):
 
         new_count = 0
         for item in page_items:
-            if item["title"] in seen_titles:
+            dedupe_key = (item.get("title", ""), item.get("date", ""), item.get("link", ""))
+            if dedupe_key in seen_items:
                 continue
-            seen_titles.add(item["title"])
+            seen_items.add(dedupe_key)
             all_items.append(item)
             new_count += 1
 
@@ -388,12 +394,26 @@ def scrape_mfds(source, limit=10, max_pages=5):
 
         time.sleep(1.5)  # 페이지 연속 요청으로 서버가 연결을 끊는 것을 방지
 
-    # 허가일 내림차순 정렬 (날짜 파싱 실패/공란은 맨 뒤로) 후 최신 limit건만 사용
-    all_items.sort(key=lambda x: x["date"] or "0000-00-00", reverse=True)
-    items = all_items[:limit]
+    cutoff_date = (datetime.now() - timedelta(days=days_back)).date()
+    today_date = datetime.now().date()
+    recent_items = []
 
-    print(f"[INFO] {label}: 총 {len(all_items)}건 후보 중 최신 {len(items)}건 선택 (허가일 기준 정렬)")
-    return items
+    for item in all_items:
+        try:
+            permit_date = datetime.strptime(item.get("date", ""), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+
+        if cutoff_date <= permit_date <= today_date:
+            recent_items.append(item)
+
+    recent_items.sort(key=lambda x: x["date"], reverse=True)
+
+    print(
+        f"[INFO] {label}: 총 {len(all_items)}건 후보 중 최근 {days_back}일 "
+        f"{len(recent_items)}건 선택 ({cutoff_date}~{today_date})"
+    )
+    return recent_items
 
 
 # -----------------------------
