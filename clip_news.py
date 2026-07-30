@@ -59,7 +59,7 @@ KEYWORD_GROUPS = {
     "항체/치료제 모달리티": ["monoclonal antibody", "antibody", "bispecific antibody", "Antibody drug conjugate", "항체"],
     "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신","疫苗"],
     "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval"
-                 "China drug approval", "식품의약품안전처", "제약바이오", "HHS biologics policy", "clinical trial", "biologics guideline", "생물학적제제 허가"],
+                 "China drug approval", "식품의약품안전처", "바이오의약품", "HHS biologics policy", "clinical trial", "biologics guideline", "생물학적제제 허가"],
 }
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
