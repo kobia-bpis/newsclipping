@@ -54,12 +54,12 @@ from dateutil import parser as dateparser
 
 KEYWORD_GROUPS = {
     "위탁개발생산(CDMO)": ["CDMO", "biologics CDMO", "위탁개발생산"],
-    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant technology", "유전자재조합의약품", "生物由來製品", "バイオ後続品", "遺伝子組換え", "生物制品", "生物活性的制品"],
-    "세포유전자치료제": ["CAR-T", "CGT", "gene therapy", "viral vector", "cell therapy", "cancer vaccine", "oncolytic virus", "CRISPR-Cas9", "유전자치료제", "세포치료제", "再生医療等製品", "细胞治疗和基因治疗产品"],
+    "바이오의약품 전반": ["Biologics", "Biopharmaceuticals", "recombinant technology", "유전자재조합의약품", "生物由來製品", "バイオ後続品", "遺伝子組換え", "生物制品", "生物活性的制品", "생물학적 제제"],
+    "세포유전자치료제": ["CAR-T", "gene therapy", "viral vector", "cell therapy", "cancer vaccine", "oncolytic virus", "CRISPR-Cas9", "유전자치료제", "세포치료제", "再生医療等製品", "细胞治疗和基因治疗产品"],
     "항체/치료제 모달리티": ["monoclonal antibody", "antibody", "bispecific antibody", "Antibody drug conjugate", "항체"],
-    "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신","疫苗", ],
+    "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신","疫苗"],
     "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval"
-                 "China drug approval", "식품의약품안전처", "HHS biologics policy", "clinical trial", "biologics guideline"],
+                 "China drug approval", "식품의약품안전처", "제약바이오", "HHS biologics policy", "clinical trial", "biologics guideline", "생물학적제제 허가"],
 }
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
