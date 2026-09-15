@@ -65,7 +65,7 @@ KEYWORD_GROUPS = {
 # 한국 뉴스 전용 검색어. 한국(ko-KR) RSS에는 아래 목록만 적용하고,
 # 그 밖의 지역에는 위 KEYWORD_GROUPS를 적용한다.
 KOREA_KEYWORD_GROUPS = {
-    "바이오의약품 관련": [
+  "바이오의약품 관련": [
         "바이오의약품", "생물의약품", "첨단바이오의약품", "바이오의약품 허가",
         "바이오의약품 심사", "바이오의약품 품질", "바이오의약품 GMP",
         "바이오의약품 임상시험", "생물학적제제", "생물학적 제제",
@@ -113,7 +113,7 @@ KOREA_KEYWORD_GROUPS = {
 KOREA_EXCLUDE_KEYWORDS = [
     "위생", "식품안전", "식품 안전", "식중독", "건강기능식품", "건기식",
     "편의점", "식당", "음식점", "외식업", "배달음식", "급식", "축산물",
-    "농산물", "수산물", "화장품", "뷰티", "메이크업", "스킨케어", "품종"
+    "농산물", "수산물", "화장품", "뷰티", "메이크업", "스킨케어",
 ]
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
@@ -173,6 +173,8 @@ MAX_ARTICLE_CHARS = 3000
 # 제목 한국어 번역 (API 키 불필요, 무료 Google Translate 비공식 엔드포인트 사용)
 # 요약과 무관하게 항상 켜짐. 끄고 싶으면 ENABLE_TITLE_TRANSLATION=0
 ENABLE_TITLE_TRANSLATION = os.environ.get("ENABLE_TITLE_TRANSLATION", "1") == "1"
+TRANSLATION_BATCH_SIZE = int(os.environ.get("TRANSLATION_BATCH_SIZE", "20"))
+TRANSLATION_MAX_WORKERS = int(os.environ.get("TRANSLATION_MAX_WORKERS", "2"))
 
 _anthropic_client = None
 _translation_cache = {}
@@ -234,6 +236,49 @@ def is_korean_title(title):
     영문·일문·중문 제목처럼 한글이 전혀 없는 제목은 번역 대상으로 처리한다.
     """
     return bool(re.search(r"[가-힣]", title or ""))
+
+
+def translate_title_batch_to_ko(titles):
+    """여러 제목을 한 번의 요청으로 번역해 제목별 결과를 반환한다.
+
+    제목 사이에 개행을 사용하며, 번역 결과의 행 수가 달라지면 해당 배치는 실패로
+    처리한다. 대량 수집 시 제목별 요청으로 인한 번역 서비스 호출 제한을 줄이기 위함이다.
+    """
+    if not titles:
+        return []
+
+    joined = "\n".join(title.replace("\n", " ").strip() for title in titles)
+    endpoints = [
+        "https://translate.googleapis.com/translate_a/single",
+        "https://translate.google.com/translate_a/single",
+    ]
+    last_error = None
+
+    for attempt in range(2):
+        for endpoint in endpoints:
+            try:
+                resp = requests.post(
+                    endpoint,
+                    data={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": joined},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                translated_text = "".join(seg[0] for seg in data[0] if seg[0])
+                translated = [line.strip() for line in translated_text.splitlines()]
+                if len(translated) != len(titles) or not all(translated):
+                    raise ValueError(
+                        f"배치 번역 행 수 불일치: 요청 {len(titles)}건, 응답 {len(translated)}건"
+                    )
+                return translated
+            except Exception as e:
+                last_error = e
+        if attempt == 0:
+            time.sleep(1)
+
+    print(f"[WARN] 제목 배치 번역 실패 ({len(titles)}건): {last_error}")
+    return [None] * len(titles)
 
 
 # -----------------------------
@@ -394,8 +439,11 @@ def summarize_ko(title, text, lang):
 
 
 def enrich_with_translations(articles):
-    """전체 기사 대상으로 제목 번역만 수행 (본문 요약과 무관, N건 제한 없음).
-    번역 대상 기사가 많아도 병렬로 처리해 전체 실행 시간을 단축한다."""
+    """전체 비한국어 제목을 배치 단위로 번역한다.
+
+    키워드 확대 후 수백 건을 제목별로 호출하면 무료 번역 서비스의 요청 제한에
+    걸릴 수 있으므로 기본 20개씩 묶고, 동시 요청 수도 기본 2개로 제한한다.
+    """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     targets = [a for a in articles if not is_korean_title(a.get("title", ""))]
@@ -403,21 +451,34 @@ def enrich_with_translations(articles):
         print("[INFO] 제목 번역 대상: 0건")
         return articles
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_article = {
-            executor.submit(translate_title_to_ko, a["title"], a["lang"]): a
-            for a in targets
+    batches = [
+        targets[i:i + TRANSLATION_BATCH_SIZE]
+        for i in range(0, len(targets), TRANSLATION_BATCH_SIZE)
+    ]
+
+    with ThreadPoolExecutor(max_workers=TRANSLATION_MAX_WORKERS) as executor:
+        future_to_batch = {
+            executor.submit(
+                translate_title_batch_to_ko,
+                [a["title"] for a in batch],
+            ): batch
+            for batch in batches
         }
-        for future in as_completed(future_to_article):
-            a = future_to_article[future]
+        for future in as_completed(future_to_batch):
+            batch = future_to_batch[future]
             try:
-                a["title_ko"] = future.result()
+                translated_titles = future.result()
             except Exception:
-                a["title_ko"] = None
+                translated_titles = [None] * len(batch)
+
+            for article, translated in zip(batch, translated_titles):
+                article["title_ko"] = translated
+                if translated:
+                    _translation_cache[article["title"]] = translated
 
     translated_count = sum(1 for a in targets if a.get("title_ko"))
     print(
-        f"[INFO] 제목 번역 결과: 대상 {len(targets)}건 / "
+        f"[INFO] 제목 번역 결과: 대상 {len(targets)}건 / 배치 {len(batches)}회 / "
         f"성공 {translated_count}건 / 실패 {len(targets) - translated_count}건"
     )
 
