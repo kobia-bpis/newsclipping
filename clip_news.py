@@ -58,9 +58,67 @@ KEYWORD_GROUPS = {
     "세포유전자치료제": ["CAR-T", "gene therapy", "viral vector", "cell therapy", "cancer vaccine", "oncolytic virus", "CRISPR-Cas9", "유전자치료제", "세포치료제", "再生医療等製品", "细胞治疗和基因治疗产品"],
     "항체/치료제 모달리티": ["monoclonal antibody", "antibody", "bispecific antibody", "Antibody drug conjugate", "항체"],
     "백신/톡신": ["vaccine", "botulinum toxin", "백신", "보툴리눔 톡신","疫苗"],
-    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval"
+    "규제/인허가": ["IND FDA", "FDA approval biologics", "PMDA approval", "BLA approval",
                  "China drug approval", "식품의약품안전처", "바이오의약품", "HHS biologics policy", "clinical trial", "biologics guideline", "생물학적제제 허가"],
 }
+
+# 한국 뉴스 전용 검색어. 한국(ko-KR) RSS에는 아래 목록만 적용하고,
+# 그 밖의 지역에는 위 KEYWORD_GROUPS를 적용한다.
+KOREA_KEYWORD_GROUPS = {
+    "바이오의약품 관련": [
+        "바이오의약품", "생물의약품", "첨단바이오의약품", "바이오의약품 허가",
+        "바이오의약품 심사", "바이오의약품 품질", "바이오의약품 GMP",
+        "바이오의약품 임상시험", "생물학적제제", "생물학적 제제",
+    ],
+    "유전자재조합 관련": [
+        "유전자재조합의약품", "유전자재조합", "재조합 단백질", "재조합의약품",
+        "단백질의약품", "항체의약품", "단클론항체", 
+        "항체치료제", "이중특이적항체", "다중특이항체", "융합단백질", "바이오시밀러",
+        "바이오베터", "항체약물접합체", "Antibody-Drug Conjugate",
+        "페이로드",  "재조합항체", "인간화항체",
+    ],
+    "백신": [
+       "백신제제", "백신의약품", "예방백신", "백신 임상시험", "백신 허가",
+        "백신 품질", "백신 제조", "백신 제조관리", "백신 품질관리", "백신 GMP",
+        "백신 제조소", "백신 국가출하승인", "백신 출하승인", "백신 안전성",
+        "보툴리눔 톡신", "혈액제제", "혈장분획제제", "백신 입찰", "백신 접종", "백신 후보물질",
+    ],
+    "세포·유전자치료제": [
+        "세포치료제", "세포치료", "유전자치료제", "유전자치료", "세포·유전자치료제",
+        "세포유전자치료제", "Cell Therapy", "Gene Therapy", "세포유전자치료",
+        "첨단바이오의약품", "첨단재생의료", "첨단재생바이오법", "첨바법",
+    ],
+    "CAR-T": [
+        "CAR-T", "CAR T", "CAR-T세포치료제", "CAR-T 치료제", "CAR-NK", "CAR-Treg",
+        "T세포치료제", "면역세포치료제", "NK세포치료제", "CAR-X", "CAR-M", "CAR-DC", "CAR-γδ T",
+    ],
+    "마이크로바이옴": [
+        "마이크로바이옴 치료제", "마이크로바이옴 의약품", "마이크로바이옴 기반 치료제",
+        "미생물 치료제", "생균치료제", "Live Biotherapeutic Product",
+    ],
+
+    "GMP": [
+        "바이오의약품 GMP", "생물학적제제 GMP", "생물의약품 GMP", "첨단바이오의약품 GMP",
+        "바이오 GMP", "GMP", "우수제조관리기준", "제조 및 품질관리기준", "제조·품질관리기준",
+        "제조관리", "품질관리", "품질보증", "품질위험관리", "밸리데이션", "공정밸리데이션",
+        "무균공정", "무균제조", "무균시험", "오염관리", "무균보증", "원료의약품 GMP",
+        "생물학적제제 제조", "바이오의약품 제조", "CDMO 위탁개발 생산", "무균의약품",
+        "무균원료의약품", "무균완제의약품",
+    ],
+    "식약처 소식": [
+        "바이오생약국", "첨단바이오의약품", "의약품정책과", "임상정책과", "임상심사과",
+        "첨단제품허가담당관", "첨단의약품품질과", "유전자재조합의약품과",
+        "바이오의약품정책과", "세포유전자치료제과", "바이오의약품연구과",
+    ],
+}
+
+# 한국 기사 제목에 아래 표현이 있으면 비관련 생활·식품·화장품 기사로 보고 제외한다.
+# '식품' 자체는 '식품의약품안전처'까지 제거할 수 있어 보다 구체적인 표현만 사용한다.
+KOREA_EXCLUDE_KEYWORDS = [
+    "위생", "식품안전", "식품 안전", "식중독", "건강기능식품", "건기식",
+    "편의점", "식당", "음식점", "외식업", "배달음식", "급식", "축산물",
+    "농산물", "수산물", "화장품", "뷰티", "메이크업", "스킨케어",
+]
 
 # 검색 언어/지역: 미국, 한국, 일본(PMDA), 중국(CDE), 영국, 독일(EU/EMA)
 LANG_REGIONS = [
@@ -134,29 +192,52 @@ def get_anthropic_client():
 
 def translate_title_to_ko(title, lang):
     """원문 제목을 한국어로 번역 (API 키 불필요, Google Translate 무료 엔드포인트 직접 호출).
-    이미 한국어면 번역하지 않고 그대로 반환. 실패/타임아웃 시 None 반환 (원문만 표시됨)."""
+    실제 제목이 이미 한국어면 번역하지 않는다. 일시적 오류에는 재시도하며,
+    두 Google Translate 호스트가 모두 실패하면 None을 반환한다."""
     if not ENABLE_TITLE_TRANSLATION:
         return None
-    if lang == "ko":
-        return None  # 이미 한국어 원문이므로 번역 불필요
+    if is_korean_title(title):
+        return None
 
     if title in _translation_cache:
         return _translation_cache[title]
 
-    try:
-        resp = requests.get(
-            "https://translate.googleapis.com/translate_a/single",
-            params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": title},
-            timeout=6,  # 응답이 느리면 6초 후 포기 (전체 실행이 늘어지는 것 방지)
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        translated = "".join(seg[0] for seg in data[0] if seg[0])
-        _translation_cache[title] = translated
-        return translated
-    except Exception as e:
-        print(f"[WARN] 제목 번역 실패 ({title[:30]}...): {e}")
-        return None
+    endpoints = [
+        "https://translate.googleapis.com/translate_a/single",
+        "https://translate.google.com/translate_a/single",
+    ]
+    last_error = None
+    for attempt in range(2):
+        for endpoint in endpoints:
+            try:
+                resp = requests.get(
+                    endpoint,
+                    params={"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": title},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=12,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                translated = "".join(seg[0] for seg in data[0] if seg[0]).strip()
+                if translated:
+                    _translation_cache[title] = translated
+                    return translated
+            except Exception as e:
+                last_error = e
+        if attempt == 0:
+            time.sleep(1)
+
+    print(f"[WARN] 제목 번역 실패 ({title[:30]}...): {last_error}")
+    return None
+
+
+def is_korean_title(title):
+    """RSS 지역 코드가 아니라 제목 문자 구성으로 한국어 제목인지 판정한다.
+
+    한글이 하나라도 포함된 한국어 중심 제목은 원문 그대로 두고, 한국 RSS에 노출된
+    영문·일문·중문 제목처럼 한글이 전혀 없는 제목은 번역 대상으로 처리한다.
+    """
+    return bool(re.search(r"[가-힣]", title or ""))
 
 
 # -----------------------------
@@ -209,6 +290,10 @@ def fetch_keyword_articles(keyword, lang_region):
 
         source = entry.get("source", {}).get("title", "") if hasattr(entry, "get") else ""
         clean_title = strip_source_suffix(entry.title, source)
+        if lang_region["hl"] == "ko":
+            title_lower = clean_title.lower()
+            if any(ex.lower() in title_lower for ex in KOREA_EXCLUDE_KEYWORDS):
+                continue
         articles.append({
             "title": clean_title,
             "link": entry.link,
@@ -230,24 +315,29 @@ def collect_all():
     all_articles = []
     seen_hashes = set()
 
-    for group, keywords in KEYWORD_GROUPS.items():
-        for kw in keywords:
-            for lr in LANG_REGIONS:
-                try:
-                    arts = fetch_keyword_articles(kw, lr)
-                except Exception as e:
-                    print(f"[WARN] {kw} ({lr['hl']}) 수집 실패: {e}")
-                    continue
+    search_jobs = []
+    for lr in LANG_REGIONS:
+        groups = KOREA_KEYWORD_GROUPS if lr["hl"] == "ko" else KEYWORD_GROUPS
+        for group, keywords in groups.items():
+            for kw in keywords:
+                search_jobs.append((group, kw, lr))
 
-                for a in arts:
-                    key = hashlib.md5(normalize_title(a["title"]).encode()).hexdigest()
-                    if key in seen_hashes:
-                        continue
-                    seen_hashes.add(key)
-                    a["group"] = group
-                    all_articles.append(a)
+    for group, kw, lr in search_jobs:
+        try:
+            arts = fetch_keyword_articles(kw, lr)
+        except Exception as e:
+            print(f"[WARN] {kw} ({lr['hl']}) 수집 실패: {e}")
+            continue
 
-                time.sleep(0.4)
+        for a in arts:
+            key = hashlib.md5(normalize_title(a["title"]).encode()).hexdigest()
+            if key in seen_hashes:
+                continue
+            seen_hashes.add(key)
+            a["group"] = group
+            all_articles.append(a)
+
+        time.sleep(0.4)
 
     return all_articles
 
@@ -312,8 +402,9 @@ def enrich_with_translations(articles):
     번역 대상 기사가 많아도 병렬로 처리해 전체 실행 시간을 단축한다."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    targets = [a for a in articles if a["lang"] != "ko"]
+    targets = [a for a in articles if not is_korean_title(a.get("title", ""))]
     if not targets:
+        print("[INFO] 제목 번역 대상: 0건")
         return articles
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -327,6 +418,12 @@ def enrich_with_translations(articles):
                 a["title_ko"] = future.result()
             except Exception:
                 a["title_ko"] = None
+
+    translated_count = sum(1 for a in targets if a.get("title_ko"))
+    print(
+        f"[INFO] 제목 번역 결과: 대상 {len(targets)}건 / "
+        f"성공 {translated_count}건 / 실패 {len(targets) - translated_count}건"
+    )
 
     return articles
 
@@ -405,9 +502,13 @@ def organize_articles(articles):
         grouped = {}
         for a in articles:
             grouped.setdefault(a["group"], []).append(a)
+        group_order = list(dict.fromkeys([
+            *KOREA_KEYWORD_GROUPS.keys(),
+            *KEYWORD_GROUPS.keys(),
+        ]))
         return [
             (g, sorted(grouped.get(g, []), key=sort_key))
-            for g in KEYWORD_GROUPS
+            for g in group_order
         ]
 
     if GROUP_BY == "country":
